@@ -1,0 +1,10 @@
+node_modules/
+.env
+slackcrawl
+slackcrawl-*
+*.exe
+.DS_Store
+*.db
+*.db-wal
+*.db-shm
+.claude/

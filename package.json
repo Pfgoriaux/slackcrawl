@@ -1,0 +1,13 @@
+{
+  "name": "slackcrawl",
+  "version": "0.1.0",
+  "scripts": {
+    "start": "bun run src/index.ts serve",
+    "dev": "bun --watch src/index.ts serve",
+    "typecheck": "bunx tsc --noEmit",
+    "build": "bun build --compile --outfile=slackcrawl src/index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
