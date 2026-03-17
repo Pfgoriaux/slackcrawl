@@ -4,11 +4,12 @@ import type { Database } from "bun:sqlite";
 import type { EmbeddingClient } from "./ai";
 import type { VecIndex } from "./vec";
 import {
-  queryDecisions, getChannelDigests, searchExpertise,
-  getUserProfile, getThreadSummary, getEnrichmentStats,
+  queryDecisions, getChannelDigests,
+  getThreadSummary,
 } from "./enrich-db";
-import { searchMessages, queryMessages, getChannelByNameOrId, getThread, getUsers } from "./db";
+import { searchMessages, queryMessages, getChannelByNameOrId, getThread } from "./db";
 import type { Message } from "./db";
+import { json, int, parseSince } from "./util";
 
 // ---- Types ----
 
@@ -58,16 +59,20 @@ export function handleDecisions(deps: EnrichApiDeps, url: URL): Response {
     else channelName = channelParam;
   }
 
-  const decisions = queryDecisions(deps.db, {
-    channelId,
-    channelName,
-    since: parseSince(p),
-    query: p.get("q") ?? undefined,
-    category: p.get("category") ?? undefined,
-    limit: int(p.get("limit"), 50),
-  });
+  try {
+    const decisions = queryDecisions(deps.db, {
+      channelId,
+      channelName,
+      since: parseSince(p),
+      query: p.get("q") ?? undefined,
+      category: p.get("category") ?? undefined,
+      limit: int(p.get("limit"), 50),
+    });
 
-  return json({ decisions, total: decisions.length });
+    return json({ decisions, total: decisions.length });
+  } catch {
+    return json({ error: "Invalid search query. Avoid special characters like *, OR, NOT, NEAR." }, 400);
+  }
 }
 
 export function handleDigests(deps: EnrichApiDeps, url: URL): Response {
@@ -99,35 +104,47 @@ export function handleExpertise(deps: EnrichApiDeps, url: URL): Response {
   const limit = int(p.get("limit"), 20);
 
   if (userId) {
-    const profile = getUserProfile(deps.db, userId);
-    if (!profile) return json({ error: "user profile not found" }, 404);
+    const row = deps.db.query<
+      { user_id: string; expertise: string | null; summary: string | null; updated_at: number; username: string | null; real_name: string | null },
+      [string]
+    >(
+      `SELECT up.*, u.username, u.real_name FROM user_profiles up
+       LEFT JOIN users u ON up.user_id = u.id
+       WHERE up.user_id = ?`,
+    ).get(userId);
+    if (!row) return json({ error: "user profile not found" }, 404);
 
-    const user = getUsers(deps.db, undefined, userId)[0];
     return json({
       profile: {
-        ...profile,
-        expertise: profile.expertise ? JSON.parse(profile.expertise) : [],
-        username: user?.username ?? null,
-        real_name: user?.real_name ?? null,
+        ...row,
+        expertise: row.expertise ? JSON.parse(row.expertise) : [],
       },
     });
   }
 
   if (!query) return json({ error: "q or user is required" }, 400);
 
-  const profiles = searchExpertise(deps.db, query, limit);
-  const users = getUsers(deps.db);
-  const results = profiles.map((p) => {
-    const user = users.find((u) => u.id === p.user_id);
-    return {
-      ...p,
-      expertise: p.expertise ? JSON.parse(p.expertise) : [],
-      username: user?.username ?? null,
-      real_name: user?.real_name ?? null,
-    };
-  });
+  try {
+    const results = deps.db.query<
+      { user_id: string; expertise: string | null; summary: string | null; updated_at: number; username: string | null; real_name: string | null },
+      [string, number]
+    >(
+      `SELECT up.*, u.username, u.real_name FROM user_profiles_fts
+       JOIN user_profiles up ON user_profiles_fts.rowid = up.rowid
+       LEFT JOIN users u ON up.user_id = u.id
+       WHERE user_profiles_fts MATCH ?
+       ORDER BY rank LIMIT ?`,
+    ).all(query, limit);
 
-  return json({ experts: results, total: results.length });
+    const experts = results.map((r) => ({
+      ...r,
+      expertise: r.expertise ? JSON.parse(r.expertise) : [],
+    }));
+
+    return json({ experts, total: experts.length });
+  } catch {
+    return json({ experts: [], total: 0 });
+  }
 }
 
 export async function handleContext(deps: EnrichApiDeps, url: URL): Promise<Response> {
@@ -172,11 +189,16 @@ export async function handleContext(deps: EnrichApiDeps, url: URL): Promise<Resp
   }
 
   // 2. Keyword search via FTS5
-  const keywordMessages = searchMessages(deps.db, topic, {
-    channelId,
-    since,
-    limit,
-  });
+  let keywordMessages: Message[] = [];
+  try {
+    keywordMessages = searchMessages(deps.db, topic, {
+      channelId,
+      since,
+      limit,
+    });
+  } catch {
+    // FTS5 syntax error (user query had special operators) — fall back to empty
+  }
 
   // 3. De-duplicate & merge
   const seen = new Set<string>();
@@ -206,18 +228,25 @@ export async function handleContext(deps: EnrichApiDeps, url: URL): Promise<Resp
     if (tts) threadKeys.add(`${m.channel_id}:${tts}`);
   }
   for (const key of threadKeys) {
-    const [chId, tts] = key.split(":");
+    const colonIdx = key.indexOf(":");
+    const chId = key.slice(0, colonIdx);
+    const tts = key.slice(colonIdx + 1);
     const summary = getThreadSummary(deps.db, chId, tts);
     if (summary) threadSummaries[key] = summary.summary;
   }
 
   // 5. Decisions for the time window
-  const decisions = queryDecisions(deps.db, {
-    channelId,
-    since,
-    query: topic,
-    limit: 20,
-  });
+  let decisions: ReturnType<typeof queryDecisions> = [];
+  try {
+    decisions = queryDecisions(deps.db, {
+      channelId,
+      since,
+      query: topic,
+      limit: 20,
+    });
+  } catch {
+    // FTS5 syntax error — skip decisions rather than fail the whole context call
+  }
 
   // 6. Digests for the time window
   const digests = getChannelDigests(deps.db, {
@@ -225,21 +254,21 @@ export async function handleContext(deps: EnrichApiDeps, url: URL): Promise<Resp
     days,
   });
 
-  // 7. Expert matches
+  // 7. Expert matches (JOIN users in SQL to avoid loading all users)
   let experts: { user_id: string; summary: string | null; username: string | null }[] = [];
   try {
-    const profiles = searchExpertise(deps.db, topic, 5);
-    const users = getUsers(deps.db);
-    experts = profiles.map((p) => {
-      const user = users.find((u) => u.id === p.user_id);
-      return {
-        user_id: p.user_id,
-        summary: p.summary,
-        username: user?.username ?? null,
-      };
-    });
+    experts = deps.db.query<
+      { user_id: string; summary: string | null; username: string | null },
+      [string, number]
+    >(
+      `SELECT up.user_id, up.summary, u.username FROM user_profiles_fts
+       JOIN user_profiles up ON user_profiles_fts.rowid = up.rowid
+       LEFT JOIN users u ON up.user_id = u.id
+       WHERE user_profiles_fts MATCH ?
+       ORDER BY rank LIMIT ?`,
+    ).all(topic, 5);
   } catch {
-    // FTS5 may fail if no profiles exist yet
+    // FTS5 may fail if no profiles exist yet or query has special chars
   }
 
   // Estimate tokens (~4 chars per token)
@@ -276,14 +305,25 @@ export async function handleEnhancedSearch(deps: EnrichApiDeps, url: URL): Promi
   }
 
   // Keyword results (always, for all modes)
-  const keywordMessages = mode !== "semantic" ? searchMessages(deps.db, q, {
-    workspaceId: deps.workspaceId,
-    channelId,
-    channelName,
-    username: p.get("author") ?? undefined,
-    since: parseSince(p),
-    limit,
-  }) : [];
+  let keywordMessages: Message[] = [];
+  if (mode !== "semantic") {
+    try {
+      keywordMessages = searchMessages(deps.db, q, {
+        workspaceId: deps.workspaceId,
+        channelId,
+        channelName,
+        username: p.get("author") ?? undefined,
+        since: parseSince(p),
+        limit,
+      });
+    } catch {
+      // FTS5 syntax error — if keyword-only mode, return the error
+      if (mode === "keyword") {
+        return json({ error: "Invalid search query. Avoid special characters like *, OR, NOT, NEAR." }, 400);
+      }
+      // hybrid mode: fall through to semantic results
+    }
+  }
 
   // Semantic results
   let semanticMessages: (Message & { score: number })[] = [];
@@ -384,22 +424,4 @@ function expandThreadsWithSummaries(db: Database, messages: Message[]) {
   return results;
 }
 
-function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-function int(s: string | null, def: number): number {
-  if (!s) return def;
-  const n = parseInt(s);
-  return isNaN(n) ? def : n;
-}
-
-function parseSince(p: URLSearchParams): number | undefined {
-  const s = p.get("since");
-  if (!s) return undefined;
-  const t = new Date(s).getTime();
-  return isNaN(t) ? undefined : Math.floor(t / 1000);
-}
+// json, int, parseSince imported from ./util

@@ -14,6 +14,7 @@ import {
 import type { VecIndex } from "./vec";
 import type { EmbeddingClient } from "./ai";
 import type { SyncOptions } from "./sync";
+import { json, int, parseSince } from "./util";
 
 type SyncCallback = (opts: SyncOptions) => void;
 type EnrichCallback = () => void;
@@ -43,9 +44,19 @@ export function createServer(
       const url = new URL(req.url);
       const path = url.pathname;
 
+      // CORS preflight
+      if (req.method === "OPTIONS") {
+        return json(null, 204);
+      }
+
       // Health — no auth required
       if (path === "/health") {
         return json({ status: "ok", time: new Date().toISOString() });
+      }
+
+      // OpenAPI schema — no auth required
+      if (path === "/v1/schema") {
+        return json(openApiSchema());
       }
 
       // Auth check for all /v1/* routes
@@ -153,7 +164,7 @@ function handleSQL(db: Database, url: URL): Response {
   if (!q) return json({ error: "q is required" }, 400);
   try {
     const rows = execReadOnly(db, q);
-    return json({ rows, total: rows.length });
+    return json({ rows, total: rows.length, warning: "This endpoint executes arbitrary read-only SQL. Do not expose without authentication." });
   } catch (err) {
     return json({ error: String(err) }, 400);
   }
@@ -190,22 +201,132 @@ function checkAuth(req: Request, apiKey: string): boolean {
   return timingSafeEqual(Buffer.from(auth), Buffer.from(expected));
 }
 
-function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-function int(s: string | null, def: number): number {
-  if (!s) return def;
-  const n = parseInt(s);
-  return isNaN(n) ? def : n;
-}
-
-function parseSince(p: URLSearchParams): number | undefined {
-  const s = p.get("since");
-  if (!s) return undefined;
-  const t = new Date(s).getTime();
-  return isNaN(t) ? undefined : Math.floor(t / 1000);
+function openApiSchema() {
+  return {
+    openapi: "3.0.3",
+    info: {
+      title: "slackcrawl",
+      version: "0.1.0",
+      description: "Slack archive REST API for AI agents. Mirrors channels into SQLite with optional AI enrichment.",
+    },
+    paths: {
+      "/health": {
+        get: { summary: "Health check", security: [], responses: { "200": { description: "OK" } } },
+      },
+      "/v1/search": {
+        get: {
+          summary: "Search messages (keyword, semantic, or hybrid)",
+          parameters: [
+            { name: "q", in: "query", required: true, schema: { type: "string" } },
+            { name: "mode", in: "query", schema: { type: "string", enum: ["keyword", "semantic", "hybrid"], default: "keyword" } },
+            { name: "channel", in: "query", schema: { type: "string" } },
+            { name: "author", in: "query", schema: { type: "string" } },
+            { name: "since", in: "query", schema: { type: "string", format: "date" } },
+            { name: "limit", in: "query", schema: { type: "integer", default: 50 } },
+            { name: "include_threads", in: "query", schema: { type: "boolean" } },
+          ],
+        },
+      },
+      "/v1/messages": {
+        get: {
+          summary: "Query messages with filters",
+          parameters: [
+            { name: "channel", in: "query", schema: { type: "string" } },
+            { name: "days", in: "query", schema: { type: "integer", default: 7 } },
+            { name: "hours", in: "query", schema: { type: "integer" } },
+            { name: "author", in: "query", schema: { type: "string" } },
+            { name: "since", in: "query", schema: { type: "string", format: "date" } },
+            { name: "until", in: "query", schema: { type: "string", format: "date" } },
+            { name: "limit", in: "query", schema: { type: "integer", default: 100 } },
+            { name: "include_threads", in: "query", schema: { type: "boolean" } },
+          ],
+        },
+      },
+      "/v1/threads": {
+        get: {
+          summary: "Get thread by timestamp",
+          parameters: [
+            { name: "channel", in: "query", required: true, schema: { type: "string" } },
+            { name: "thread_ts", in: "query", required: true, schema: { type: "string" } },
+          ],
+        },
+      },
+      "/v1/channels": {
+        get: {
+          summary: "List channels",
+          parameters: [
+            { name: "archived", in: "query", schema: { type: "boolean" } },
+          ],
+        },
+      },
+      "/v1/members": {
+        get: {
+          summary: "Search members",
+          parameters: [
+            { name: "query", in: "query", schema: { type: "string" } },
+          ],
+        },
+      },
+      "/v1/status": { get: { summary: "DB and enrichment statistics" } },
+      "/v1/sync": { post: { summary: "Trigger background sync", requestBody: { content: { "application/json": { schema: { type: "object", properties: { channel: { type: "string" } } } } } } } },
+      "/v1/sql": {
+        get: {
+          summary: "Execute read-only SQL (use with caution)",
+          parameters: [
+            { name: "q", in: "query", required: true, schema: { type: "string" } },
+          ],
+        },
+      },
+      "/v1/context": {
+        get: {
+          summary: "Bundled context for agents — the main endpoint",
+          parameters: [
+            { name: "topic", in: "query", required: true, schema: { type: "string" } },
+            { name: "channel", in: "query", schema: { type: "string" } },
+            { name: "days", in: "query", schema: { type: "integer", default: 14 } },
+            { name: "limit", in: "query", schema: { type: "integer", default: 10 } },
+          ],
+        },
+      },
+      "/v1/decisions": {
+        get: {
+          summary: "Query extracted decisions and action items",
+          parameters: [
+            { name: "channel", in: "query", schema: { type: "string" } },
+            { name: "since", in: "query", schema: { type: "string", format: "date" } },
+            { name: "q", in: "query", schema: { type: "string" } },
+            { name: "category", in: "query", schema: { type: "string", enum: ["decision", "action_item", "conclusion", "commitment"] } },
+            { name: "limit", in: "query", schema: { type: "integer", default: 50 } },
+          ],
+        },
+      },
+      "/v1/digests": {
+        get: {
+          summary: "Query daily channel digests",
+          parameters: [
+            { name: "channel", in: "query", schema: { type: "string" } },
+            { name: "days", in: "query", schema: { type: "integer", default: 7 } },
+            { name: "date", in: "query", schema: { type: "string", format: "date" } },
+          ],
+        },
+      },
+      "/v1/expertise": {
+        get: {
+          summary: "Search expertise profiles or get user profile",
+          parameters: [
+            { name: "q", in: "query", schema: { type: "string" } },
+            { name: "user", in: "query", schema: { type: "string" } },
+            { name: "limit", in: "query", schema: { type: "integer", default: 20 } },
+          ],
+        },
+      },
+      "/v1/enrich": { post: { summary: "Trigger enrichment pipeline" } },
+    },
+    components: {
+      securitySchemes: {
+        bearer: { type: "http", scheme: "bearer" },
+      },
+    },
+    security: [{ bearer: [] }],
+  };
 }

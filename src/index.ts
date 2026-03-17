@@ -121,7 +121,18 @@ async function cmdServe() {
 
   // Polling loop.
   console.log(`[serve] sync interval: ${cfg.syncIntervalMs / 1000}s`);
-  setInterval(() => doSync(), cfg.syncIntervalMs);
+  const syncTimer = setInterval(() => doSync(), cfg.syncIntervalMs);
+
+  // Graceful shutdown
+  const shutdown = () => {
+    console.log("[serve] shutting down...");
+    clearInterval(syncTimer);
+    server.stop();
+    db.close();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
 async function cmdSync() {
