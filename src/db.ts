@@ -14,6 +14,7 @@ export function openDB(path: string): Database {
   db.exec("PRAGMA foreign_keys=ON");
   db.exec("PRAGMA synchronous=NORMAL");
   db.exec("PRAGMA cache_size=10000");
+  db.exec("PRAGMA busy_timeout=5000");
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS workspaces (
@@ -57,6 +58,7 @@ export function openDB(path: string): Database {
       channel_id      TEXT NOT NULL,
       ts              TEXT NOT NULL,
       thread_ts       TEXT,
+      subtype         TEXT,
       user_id         TEXT,
       username        TEXT,
       text            TEXT,
@@ -67,6 +69,7 @@ export function openDB(path: string): Database {
       reply_users     TEXT,
       edited_ts       TEXT,
       created_at      INTEGER,
+      deleted_at      INTEGER,
       raw_json        TEXT
     );
 
@@ -74,6 +77,7 @@ export function openDB(path: string): Database {
     CREATE INDEX IF NOT EXISTS idx_messages_workspace  ON messages(workspace_id);
     CREATE INDEX IF NOT EXISTS idx_messages_user       ON messages(user_id);
     CREATE INDEX IF NOT EXISTS idx_messages_created    ON messages(created_at);
+    CREATE INDEX IF NOT EXISTS idx_messages_thread     ON messages(channel_id, thread_ts);
     CREATE INDEX IF NOT EXISTS idx_channels_workspace  ON channels(workspace_id);
 
     CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -101,10 +105,32 @@ export function openDB(path: string): Database {
     END;
   `);
 
+  migrateMessages(db);
   initEnrichmentSchema(db);
 
   return db;
 }
+
+/** Add columns introduced after the initial release to pre-existing databases. */
+function migrateMessages(db: Database) {
+  const cols = new Set(
+    db.query<{ name: string }, []>("PRAGMA table_info(messages)").all().map((r) => r.name),
+  );
+  if (!cols.has("subtype"))    db.exec("ALTER TABLE messages ADD COLUMN subtype TEXT");
+  if (!cols.has("deleted_at")) db.exec("ALTER TABLE messages ADD COLUMN deleted_at INTEGER");
+}
+
+// Slack system/noise message subtypes excluded from search and enrichment
+// (still stored, so nothing is lost — just kept out of the signal paths).
+export const NOISE_SUBTYPES = [
+  "channel_join", "channel_leave", "channel_topic", "channel_purpose", "channel_name",
+  "channel_archive", "channel_unarchive", "group_join", "group_leave", "group_topic",
+  "group_purpose", "group_name", "group_archive", "group_unarchive", "bot_add", "bot_remove",
+  "pinned_item", "unpinned_item", "reminder_add",
+];
+const NOISE_LIST = NOISE_SUBTYPES.map((s) => `'${s}'`).join(", ");
+/** SQL fragment (prefix the column with table alias `m`) keeping only real, live messages. */
+export const SIGNAL_FILTER = `m.deleted_at IS NULL AND (m.subtype IS NULL OR m.subtype NOT IN (${NOISE_LIST}))`;
 
 // ---- Types ----
 
@@ -149,6 +175,7 @@ export interface Message {
   channel_id: string;
   ts: string;
   thread_ts: string | null;
+  subtype: string | null;
   user_id: string | null;
   username: string | null;
   text: string | null;
@@ -159,6 +186,7 @@ export interface Message {
   reply_users: string | null;
   edited_ts: string | null;
   created_at: number | null;
+  deleted_at: number | null;
   raw_json: string | null;
 }
 
@@ -213,16 +241,18 @@ export function upsertUser(db: Database, u: Omit<User, "synced_at">) {
 }
 
 export function upsertMessage(db: Database, m: Message) {
+  // Seeing a message again means it still exists in Slack — clear any tombstone.
   db.run(
-    `INSERT INTO messages(id, workspace_id, channel_id, ts, thread_ts, user_id, username, text,
-       has_attachments, has_files, reactions, reply_count, reply_users, edited_ts, created_at, raw_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO messages(id, workspace_id, channel_id, ts, thread_ts, subtype, user_id, username, text,
+       has_attachments, has_files, reactions, reply_count, reply_users, edited_ts, created_at, deleted_at, raw_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
      ON CONFLICT(id) DO UPDATE SET
-       text=excluded.text, has_attachments=excluded.has_attachments, has_files=excluded.has_files,
-       reactions=excluded.reactions, reply_count=excluded.reply_count,
-       reply_users=excluded.reply_users, edited_ts=excluded.edited_ts, raw_json=excluded.raw_json`,
+       text=excluded.text, subtype=excluded.subtype, has_attachments=excluded.has_attachments,
+       has_files=excluded.has_files, reactions=excluded.reactions, reply_count=excluded.reply_count,
+       reply_users=excluded.reply_users, edited_ts=excluded.edited_ts, raw_json=excluded.raw_json,
+       deleted_at=NULL`,
     [
-      m.id, m.workspace_id, m.channel_id, m.ts, m.thread_ts, m.user_id, m.username, m.text,
+      m.id, m.workspace_id, m.channel_id, m.ts, m.thread_ts, m.subtype, m.user_id, m.username, m.text,
       m.has_attachments, m.has_files, m.reactions, m.reply_count,
       m.reply_users, m.edited_ts, m.created_at, m.raw_json,
     ],
@@ -244,7 +274,7 @@ export interface MessageFilter {
 
 export function queryMessages(db: Database, f: MessageFilter): Message[] {
   const limit = f.last || f.limit || 100;
-  const conds: string[] = [];
+  const conds: string[] = ["m.deleted_at IS NULL"];
   const args: (string | number)[] = [];
 
   if (f.workspaceId) { conds.push("m.workspace_id = ?"); args.push(f.workspaceId); }
@@ -267,7 +297,7 @@ export function queryMessages(db: Database, f: MessageFilter): Message[] {
 
 export function searchMessages(db: Database, query: string, f: Omit<MessageFilter, "last" | "until">): Message[] {
   const limit = f.limit || 50;
-  const conds: string[] = ["messages_fts MATCH ?"];
+  const conds: string[] = ["messages_fts MATCH ?", SIGNAL_FILTER];
   const args: (string | number)[] = [query];
 
   if (f.workspaceId) { conds.push("m.workspace_id = ?"); args.push(f.workspaceId); }
@@ -297,17 +327,25 @@ export function getChannels(db: Database, workspaceId?: string, includeArchived 
   return db.query<Channel, string[]>(`SELECT * FROM channels ${where} ORDER BY name`).all(...args);
 }
 
-export function pruneChannels(db: Database, workspaceId: string, keepIds: string[]) {
-  if (keepIds.length === 0) return;
+/**
+ * Mark channels no longer in the active filter as archived, WITHOUT deleting their
+ * history. The objective is "never lose context" — narrowing SLACKCRAWL_CHANNELS (or a
+ * transient miss) must not destroy an archive. The rows just stop being synced.
+ * Returns the names/ids that were deactivated.
+ */
+export function deactivateUnlistedChannels(db: Database, workspaceId: string, keepIds: string[]): string[] {
+  if (keepIds.length === 0) return [];
   const placeholders = keepIds.map(() => "?").join(", ");
-  db.run(
-    `DELETE FROM messages WHERE workspace_id = ? AND channel_id NOT IN (${placeholders})`,
-    [workspaceId, ...keepIds],
-  );
-  db.run(
-    `DELETE FROM channels WHERE workspace_id = ? AND id NOT IN (${placeholders})`,
-    [workspaceId, ...keepIds],
-  );
+  const stale = db.query<{ id: string; name: string | null }, string[]>(
+    `SELECT id, name FROM channels WHERE workspace_id = ? AND is_archived = 0 AND id NOT IN (${placeholders})`,
+  ).all(workspaceId, ...keepIds);
+  if (stale.length) {
+    db.run(
+      `UPDATE channels SET is_archived = 1 WHERE workspace_id = ? AND id NOT IN (${placeholders})`,
+      [workspaceId, ...keepIds],
+    );
+  }
+  return stale.map((c) => c.name ?? c.id);
 }
 
 export function getChannelByNameOrId(db: Database, workspaceId: string, nameOrId: string): Channel | null {
@@ -357,7 +395,7 @@ export interface ThreadContext {
 
 export function getThread(db: Database, channelId: string, threadTs: string): Message[] {
   return db.query<Message, [string, string, string]>(
-    "SELECT * FROM messages WHERE channel_id = ? AND (ts = ? OR thread_ts = ?) ORDER BY created_at ASC",
+    "SELECT * FROM messages WHERE channel_id = ? AND (ts = ? OR thread_ts = ?) AND deleted_at IS NULL ORDER BY created_at ASC",
   ).all(channelId, threadTs, threadTs);
 }
 
@@ -386,13 +424,58 @@ export function expandThreads(db: Database, messages: Message[]): ThreadContext[
   });
 }
 
-export function execReadOnly(db: Database, sql: string): unknown[] {
-  // Open a separate read-only connection so SQLite itself enforces no writes —
-  // no regex filtering needed or trusted.
-  const roDb = new Database(db.filename, { readonly: true });
-  try {
-    return roDb.query(sql).all();
-  } finally {
-    roDb.close();
-  }
+// ---- Thread re-polling & reconciliation (data-completeness) ----
+
+export interface ThreadRoot {
+  channel_id: string;
+  thread_ts: string;       // root ts
+  stored_max_reply_ts: string | null; // newest reply (or root) we already have
+}
+
+/**
+ * Active thread roots in a channel that may have accrued new replies recently.
+ * Used every sync cycle to re-poll replies (only fetching newer than stored_max_reply_ts),
+ * which fixes the bug where replies to threads outside the history window were lost.
+ * `sinceUnix` bounds the work to threads with recent activity.
+ */
+export function getActiveThreadRoots(db: Database, channelId: string, sinceUnix: number): ThreadRoot[] {
+  return db.query<ThreadRoot, [string, number, number]>(
+    `SELECT m.channel_id, m.ts AS thread_ts,
+            (SELECT MAX(r.ts) FROM messages r
+              WHERE r.channel_id = m.channel_id AND (r.ts = m.ts OR r.thread_ts = m.ts)) AS stored_max_reply_ts
+     FROM messages m
+     WHERE m.channel_id = ? AND m.reply_count > 0 AND m.thread_ts IS NULL
+       AND m.deleted_at IS NULL
+       AND (m.created_at >= ? OR CAST(m.ts AS REAL) >= ?)`,
+  ).all(channelId, sinceUnix, sinceUnix);
+}
+
+/** Every thread root in a channel (used by full reconciliation). */
+export function getAllThreadRoots(db: Database, channelId: string): ThreadRoot[] {
+  return db.query<ThreadRoot, [string]>(
+    `SELECT m.channel_id, m.ts AS thread_ts,
+            (SELECT MAX(r.ts) FROM messages r
+              WHERE r.channel_id = m.channel_id AND (r.ts = m.ts OR r.thread_ts = m.ts)) AS stored_max_reply_ts
+     FROM messages m
+     WHERE m.channel_id = ? AND m.reply_count > 0 AND m.thread_ts IS NULL`,
+  ).all(channelId);
+}
+
+/** All non-deleted message ids currently stored for a channel (for deletion detection). */
+export function getStoredMessageIds(db: Database, channelId: string): string[] {
+  return db.query<{ id: string }, [string]>(
+    "SELECT id FROM messages WHERE channel_id = ? AND deleted_at IS NULL",
+  ).all(channelId).map((r) => r.id);
+}
+
+/** Tombstone messages that are no longer present in Slack (reconciliation). */
+export function markMessagesDeleted(db: Database, ids: string[]): number {
+  if (ids.length === 0) return 0;
+  const now = Math.floor(Date.now() / 1000);
+  const tx = db.transaction((batch: string[]) => {
+    const stmt = db.query("UPDATE messages SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL");
+    for (const id of batch) stmt.run(now, id);
+  });
+  tx(ids);
+  return ids.length;
 }

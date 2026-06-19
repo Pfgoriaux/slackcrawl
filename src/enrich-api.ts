@@ -18,6 +18,7 @@ export interface EnrichApiDeps {
   workspaceId: string;
   vecIndex: VecIndex | null;
   embedder: EmbeddingClient | null;
+  maxLimit: number;
 }
 
 // LRU cache for query embeddings
@@ -66,7 +67,7 @@ export function handleDecisions(deps: EnrichApiDeps, url: URL): Response {
       since: parseSince(p),
       query: p.get("q") ?? undefined,
       category: p.get("category") ?? undefined,
-      limit: int(p.get("limit"), 50),
+      limit: int(p.get("limit"), 50, deps.maxLimit),
     });
 
     return json({ decisions, total: decisions.length });
@@ -101,7 +102,7 @@ export function handleExpertise(deps: EnrichApiDeps, url: URL): Response {
   const p = url.searchParams;
   const query = p.get("q");
   const userId = p.get("user");
-  const limit = int(p.get("limit"), 20);
+  const limit = int(p.get("limit"), 20, deps.maxLimit);
 
   if (userId) {
     const row = deps.db.query<
@@ -153,8 +154,8 @@ export async function handleContext(deps: EnrichApiDeps, url: URL): Promise<Resp
   if (!topic) return json({ error: "topic is required" }, 400);
 
   const channelParam = p.get("channel");
-  const days = int(p.get("days"), 14);
-  const limit = int(p.get("limit"), 10);
+  const days = int(p.get("days"), 14, 3650);
+  const limit = int(p.get("limit"), 10, deps.maxLimit);
   const since = Math.floor(Date.now() / 1000) - days * 86400;
 
   let channelId: string | undefined;
@@ -293,7 +294,7 @@ export async function handleEnhancedSearch(deps: EnrichApiDeps, url: URL): Promi
   if (!q) return json({ error: "q is required" }, 400);
 
   const mode = p.get("mode") ?? "keyword";
-  const limit = int(p.get("limit"), 50);
+  const limit = int(p.get("limit"), 50, deps.maxLimit);
   const channelParam = p.get("channel");
 
   let channelId: string | undefined;

@@ -6,7 +6,7 @@ slackcrawl mirrors Slack into a local SQLite database and exposes a REST API. Yo
 
 **1. REST API** (preferred when the server is running)
 Base URL: `http://localhost:${PORT:-8080}`
-Auth header: `Authorization: Bearer $SLACKCRAWL_API_KEY`
+Auth header: `Authorization: Bearer $SLACKCRAWL_API_KEY` (any configured API key)
 
 ### Core endpoints
 
@@ -19,8 +19,7 @@ Auth header: `Authorization: Bearer $SLACKCRAWL_API_KEY`
 | `GET /v1/threads?channel=NAME&thread_ts=TS` | Fetch a single complete thread (root + all replies) by its root timestamp |
 | `GET /v1/channels` | List all synced channels and their metadata |
 | `GET /v1/members?query=NAME` | Look up a specific person |
-| `GET /v1/sql?q=SELECT+...` | Complex aggregations — counts, top contributors, trends |
-| `POST /v1/sync` body `{"channel":"NAME"}` | Trigger a fresh sync if data looks stale |
+| `POST /v1/sync` body `{"channel":"NAME"}` or `{"full":true}` | Trigger a fresh sync (or full reconciliation) if data looks stale |
 
 ### Search modes
 
@@ -86,11 +85,11 @@ This ensures the operator always has up-to-date Slack context without having to 
    - "give me a summary of #channel" → `/v1/digests?channel=NAME&days=7`
    - "what did @alice post?" → `/v1/messages?author=alice&days=30`
    - "who knows about Y?" → `/v1/expertise?q=Y`
-   - "which channels are most active?" → `/v1/sql?q=SELECT channel_id, count(*) FROM messages GROUP BY channel_id ORDER BY 2 DESC LIMIT 10`
+   - "which channels are most active?" → `/v1/channels` (compare `member_count`) or scan `/v1/messages?channel=NAME&days=N` per channel
    - "is the sync up to date?" → `/v1/status`
    - "who works on Y?" → `/v1/search?q=Y&mode=hybrid` + `/v1/members?query=...`
    - broad temporal question ("last week") → raise `limit` to 200, then summarize in passes
-4. **Prefer `/v1/context` for topic-based questions** — it bundles semantic matches, keyword matches, thread summaries, decisions, digests, and experts into one call. Check the `token_estimate` field to gauge how much context you're about to use. Fall back to individual endpoints only when you need more control (e.g. specific author filters, date ranges, or SQL aggregations)
+4. **Prefer `/v1/context` for topic-based questions** — it bundles semantic matches, keyword matches, thread summaries, decisions, digests, and experts into one call. Check the `token_estimate` field to gauge how much context you're about to use. Fall back to individual endpoints only when you need more control (e.g. specific author filters or date ranges)
 5. **Get full thread context** — whenever a message has `reply_count > 0` or is a thread reply, you need the full conversation to draw conclusions. Two strategies:
    - Add `&include_threads=true` to your `/v1/search` or `/v1/messages` request — the response gains a `threads` array where each entry has `{ thread_ts, channel_id, root, replies }` covering every thread that appeared in results
    - Or call `GET /v1/threads?channel=NAME&thread_ts=TS` directly once you know the specific thread you care about
