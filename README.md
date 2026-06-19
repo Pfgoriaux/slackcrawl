@@ -22,6 +22,38 @@ With AI enrichment enabled (optional — needs a Claude API key and an OpenAI AP
 
 Without API keys, nothing changes. Same behavior as before.
 
+## How sync stays complete
+
+The goal is to never lose a message from any channel the bot is in (public or private —
+DMs are never touched). Slack's polling API makes that non-trivial, so sync runs at two
+cadences:
+
+- **Incremental** (`SLACKCRAWL_SYNC_INTERVAL`, default 10m): fetches new top-level
+  messages since the last watermark, **and** re-polls replies for any thread active in
+  the last `SLACKCRAWL_THREAD_REPOLL_DAYS` (default 14). This is what catches replies that
+  land on threads whose root is older than the polling window — a reply that plain history
+  polling would otherwise miss forever.
+- **Reconciliation** (`SLACKCRAWL_RECONCILE_INTERVAL`, default 24h, set `0` to disable):
+  a full re-scan of every channel. It captures **edits** to old messages, re-polls all
+  threads completely, and detects **deletions** — a message that vanished from Slack is
+  marked with a `deleted_at` tombstone (kept in the DB, hidden from search/results) rather
+  than dropped, so the archive is auditable. You can trigger one on demand with
+  `slackcrawl sync --full` or `POST /v1/sync {"full":true}`.
+
+Channels removed from `SLACKCRAWL_CHANNELS` are deactivated, not deleted — their history
+is preserved. System/noise messages (joins, topic changes, etc.) are stored but excluded
+from search and AI enrichment.
+
+### A note on Slack rate limits
+
+As of 2025-05-29 Slack throttles `conversations.history`/`replies` hard for
+non-Marketplace apps **created after that date**: ~1 request/minute and ~15 messages per
+page. Internal/custom workspace apps (the `xoxb-` bot this README sets up) generally keep
+the older ~50 req/min tier. slackcrawl honors `Retry-After` automatically, but if your app
+is on the new tier, raise `SLACKCRAWL_SLACK_MIN_INTERVAL_MS` (e.g. `60000`) so the global
+rate limiter paces requests accordingly — initial backfill of a busy workspace will then
+take a while.
+
 ## Slack bot setup
 
 1. Create a Slack app at [api.slack.com/apps](https://api.slack.com/apps)
@@ -84,9 +116,10 @@ Point Coolify at this repo and set environment variables:
 
 ```
 SLACK_BOT_TOKEN=xoxb-your-bot-token
-SLACKCRAWL_API_KEY=your-secret-key
+SLACKCRAWL_API_KEYS=data-team:LONG_RANDOM_SECRET,ci-bot:ANOTHER_LONG_SECRET
 SLACKCRAWL_CHANNELS=general,team-eng   # optional: leave empty to sync all bot channels
-SLACKCRAWL_SYNC_INTERVAL=10m           # optional: polling interval (default 10m)
+SLACKCRAWL_SYNC_INTERVAL=10m           # optional: incremental polling interval
+SLACKCRAWL_RECONCILE_INTERVAL=24h      # optional: full re-scan (edits/deletions)
 DATA_DIR=/data
 
 # Optional: enable AI enrichment
@@ -94,7 +127,19 @@ CLAUDE_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-...
 ```
 
-Mount a persistent volume at `/data`. The default command (`serve`) starts the API server and the background sync loop. If both AI keys are set, enrichment runs automatically after each sync.
+Mount a persistent volume at `/data`. The default command (`serve`) starts the API server
+and the background sync + reconciliation loops. If both AI keys are set, enrichment runs
+(bounded per cycle) after each sync.
+
+Notes for production:
+
+- The container runs as a non-root user, ships a compiled binary, and exposes a Docker
+  `HEALTHCHECK` against `/health`.
+- Let Coolify terminate TLS and proxy to port 8080 — the app speaks plain HTTP and has no
+  built-in TLS or HTTP rate limiting. Don't expose 8080 directly to the internet.
+- `serve` refuses to start without an API key unless `SLACKCRAWL_ALLOW_NO_AUTH=true`.
+- On `SIGTERM` (redeploys) the server drains in-flight requests, lets the current sync/
+  enrichment reach a safe point, checkpoints the WAL, and exits cleanly.
 
 ## Commands
 
@@ -108,13 +153,34 @@ Mount a persistent volume at `/data`. The default command (`serve`) starts the A
 
 ## REST API
 
-All endpoints except `/health` require `Authorization: Bearer <SLACKCRAWL_API_KEY>`.
+All endpoints except `/health` and `/v1/schema` require `Authorization: Bearer <key>`,
+where `<key>` is any of the configured API keys.
 
-All examples below use `$API` as shorthand for `https://your-instance` and assume you have set:
+### Authentication
+
+Configure one or more named keys. The name of the matching key is logged with every
+request, giving you a per-caller audit trail and the ability to revoke a single key
+(e.g. one agent) without rotating everyone else's.
+
+```bash
+# Multiple named keys (recommended): give each team/agent its own
+export SLACKCRAWL_API_KEYS="data-team:$(openssl rand -hex 24),ci-bot:$(openssl rand -hex 24)"
+
+# Or a single key (name defaults to "default")
+export SLACKCRAWL_API_KEY=$(openssl rand -hex 24)
+```
+
+Keys must be at least 16 characters; the example placeholder values are rejected. If no
+key is set, `serve` refuses to start unless you explicitly set `SLACKCRAWL_ALLOW_NO_AUTH=true`.
+Comparison is constant-time. There is no per-channel authorization — any valid key can
+read every archived channel — so treat keys as workspace-wide secrets and put the service
+behind a TLS-terminating reverse proxy.
+
+All examples below use `$API` as shorthand for `https://your-instance` and assume:
 
 ```bash
 export API=https://your-instance  # or http://localhost:8080
-export SLACKCRAWL_API_KEY=my-secret
+export SLACKCRAWL_API_KEY=my-very-long-secret-key
 ```
 
 ### Core endpoints
@@ -130,8 +196,7 @@ GET  /v1/threads?channel=general&thread_ts=1712345678.000100
 GET  /v1/channels[?archived=true]
 GET  /v1/members[?query=alice]
 GET  /v1/status
-POST /v1/sync                          body: {"channel":"general"}
-GET  /v1/sql?q=SELECT+count(*)+FROM+messages
+POST /v1/sync                          body: {"channel":"general","full":true}
 ```
 
 #### Health check (no auth)
@@ -141,8 +206,12 @@ curl "$API/health"
 ```
 
 ```json
-{"status": "ok", "time": "2026-03-17T10:00:00.000Z"}
+{"status": "ok", "ready": true, "time": "2026-03-17T10:00:00.000Z"}
 ```
+
+`status` is always `ok` while the process is alive (use it as the container liveness
+probe). `ready` becomes `true` once the first sync has completed and the workspace is
+resolved — use it to know when query results are meaningful.
 
 #### List channels
 
@@ -253,19 +322,12 @@ curl -X POST -H "Authorization: Bearer $SLACKCRAWL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"channel": "general"}' \
   "$API/v1/sync"
-```
 
-#### Run raw SQL (read-only)
-
-> **Security note:** This endpoint executes arbitrary SQL on a read-only connection. It cannot modify data, but it can read everything in the database including message contents, user emails, and raw JSON. Only expose this with authentication enabled.
-
-```bash
-curl -H "Authorization: Bearer $SLACKCRAWL_API_KEY" \
-  "$API/v1/sql?q=SELECT+count(*)+FROM+messages"
-```
-
-```json
-{"rows": [{"count(*)": 12483}], "total": 1}
+# Force a full reconciliation (re-scan everything; catches edits & deletions)
+curl -X POST -H "Authorization: Bearer $SLACKCRAWL_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"full": true}' \
+  "$API/v1/sync"
 ```
 
 #### Status and statistics
@@ -671,19 +733,27 @@ Runs once per day. Users with 5+ messages get an expertise profile generated fro
 | Variable | Default | Description |
 |---|---|---|
 | `SLACK_BOT_TOKEN` | — | Required. Slack bot token (`xoxb-...`) |
-| `SLACKCRAWL_API_KEY` | — | API key for REST endpoints. Leave empty only for local-only use |
-| `SLACKCRAWL_CHANNELS` | all bot channels | Comma-separated channel names or IDs to monitor |
-| `SLACKCRAWL_SYNC_INTERVAL` | `10m` | Polling interval (`5m`, `1h`, etc.) |
+| `SLACKCRAWL_API_KEYS` | — | Comma-separated named keys: `alice:key1,ci-bot:key2`. The matched key's name is logged with every request (audit trail). |
+| `SLACKCRAWL_API_KEY` | — | Single API key (name `default`). Merged with `SLACKCRAWL_API_KEYS` if both are set. Keys must be ≥16 chars; example placeholders are rejected. |
+| `SLACKCRAWL_ALLOW_NO_AUTH` | `false` | Set `true` to intentionally run unauthenticated. Otherwise `serve` refuses to start with no key. |
+| `SLACKCRAWL_CHANNELS` | all bot channels | Comma-separated channel names or IDs to monitor. Removing a channel here stops syncing it but **never deletes its history**. |
+| `SLACKCRAWL_SYNC_INTERVAL` | `10m` | Incremental polling interval (`5m`, `1h`, etc.) |
+| `SLACKCRAWL_RECONCILE_INTERVAL` | `24h` | Full reconciliation interval. Re-scans everything to catch edits, deletions, and missed replies. `0` disables it. |
+| `SLACKCRAWL_THREAD_REPOLL_DAYS` | `14` | Each incremental cycle re-polls replies for threads active within this many days (cheap fix for replies on older threads). |
+| `SLACKCRAWL_SLACK_MIN_INTERVAL_MS` | `1200` | Minimum ms between **all** Slack API calls (global rate limiter). Raise for apps under Slack's new ~1 req/min cap (see below). |
+| `SLACKCRAWL_SLACK_PAGE_LIMIT` | `200` | Page size for history/replies. Slack silently clamps this to 15 for non-Marketplace apps created after 2025-05-29. |
+| `SLACKCRAWL_MAX_LIMIT` | `500` | Hard cap on any `limit`/`last` query param (prevents memory-exhaustion requests). |
 | `DATA_DIR` | `~/.slackcrawl` | Directory for the SQLite database |
 | `SLACKCRAWL_DB_PATH` | `$DATA_DIR/slackcrawl.db` | Override DB path directly |
 | `PORT` | `8080` | HTTP listen port |
-| `SLACKCRAWL_HOST` | `0.0.0.0` | HTTP listen host |
+| `SLACKCRAWL_HOST` | `0.0.0.0` | HTTP listen host. Bind `127.0.0.1` if not behind a trusted proxy. |
 | `CLAUDE_API_KEY` | — | Claude API key. Enables summaries, decisions, digests, profiles |
 | `OPENAI_API_KEY` | — | OpenAI API key. Enables embeddings and semantic search |
-| `CLAUDE_MODEL` | `claude-sonnet-4-20250514` | Claude model to use |
+| `CLAUDE_MODEL` | `claude-sonnet-4-6` | Claude model to use |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI embedding model |
 | `SLACKCRAWL_ENRICH_BATCH` | `100` | How many messages to embed per API call |
 | `SLACKCRAWL_ENRICH_MIN_REPLIES` | `2` | Minimum thread replies before summarizing |
+| `SLACKCRAWL_ENRICH_MAX_PER_CYCLE` | `500` | Cap on items processed per enrichment stage per cycle (bounds cost/time; the rest is picked up next cycle). |
 | `SLACKCRAWL_CORS_ORIGIN` | `*` | CORS `Access-Control-Allow-Origin` header value |
 
 ## DB tables

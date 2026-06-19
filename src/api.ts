@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { timingSafeEqual } from "node:crypto";
 import {
   queryMessages, getChannels, getUsers,
-  getWorkspace, getStats, execReadOnly, getThread, expandThreads,
+  getWorkspace, getStats, getThread, expandThreads,
   getChannelByNameOrId,
 } from "./db";
 import { getEnrichmentStats } from "./enrich-db";
@@ -14,74 +14,86 @@ import {
 import type { VecIndex } from "./vec";
 import type { EmbeddingClient } from "./ai";
 import type { SyncOptions } from "./sync";
-import { json, int, parseSince } from "./util";
+import type { ApiKey } from "./config";
+import { json, int, parseSince, parseDateParam } from "./util";
 
 type SyncCallback = (opts: SyncOptions) => void;
 type EnrichCallback = () => void;
 
+export interface WorkspaceRef { workspaceId: string }
+
+export interface ServerOptions {
+  vecIndex?: VecIndex | null;
+  embedder?: EmbeddingClient | null;
+  onEnrich?: EnrichCallback;
+  port: number;
+  host: string;
+  maxLimit: number;
+  maxBodyBytes?: number;
+  isReady?: () => boolean;
+}
+
 export function createServer(
   db: Database,
-  apiKey: string,
-  workspaceId: string,
+  apiKeys: ApiKey[],
+  wsRef: WorkspaceRef,
   onSync: SyncCallback,
-  opts?: {
-    vecIndex?: VecIndex | null;
-    embedder?: EmbeddingClient | null;
-    onEnrich?: EnrichCallback;
-  },
+  opts: ServerOptions,
 ) {
-  const enrichDeps: EnrichApiDeps = {
-    db,
-    workspaceId,
-    vecIndex: opts?.vecIndex ?? null,
-    embedder: opts?.embedder ?? null,
-  };
-  return Bun.serve({
-    port: parseInt(process.env.PORT ?? "8080"),
-    hostname: process.env.SLACKCRAWL_HOST ?? "0.0.0.0",
+  const maxLimit = opts.maxLimit;
 
-    fetch(req) {
+  return Bun.serve({
+    port: opts.port,
+    hostname: opts.host,
+    maxRequestBodySize: opts.maxBodyBytes ?? 1024 * 1024, // 1 MiB
+    idleTimeout: 30,
+
+    async fetch(req) {
+      const started = Date.now();
       const url = new URL(req.url);
       const path = url.pathname;
+      let status = 200;
+      let keyName = "-";
 
-      // CORS preflight
-      if (req.method === "OPTIONS") {
-        return json(null, 204);
+      try {
+        // CORS preflight — no auth, no body.
+        if (req.method === "OPTIONS") return json(null, 204);
+
+        // Liveness — always 200 while the server responds (don't gate on readiness, or a
+        // long initial sync would trip container restarts). Readiness is in the body.
+        if (path === "/health") {
+          const ready = opts.isReady ? opts.isReady() : true;
+          return json({ status: "ok", ready, time: new Date().toISOString() });
+        }
+
+        // OpenAPI schema — no auth required (agent discovery).
+        if (path === "/v1/schema") return json(openApiSchema());
+
+        // Auth for all /v1/* routes.
+        const auth = authenticate(req, apiKeys);
+        if (!auth) { status = 401; return json({ error: "unauthorized" }, 401); }
+        keyName = auth.name;
+
+        const workspaceId = wsRef.workspaceId;
+        const enrichDeps: EnrichApiDeps = {
+          db,
+          workspaceId,
+          vecIndex: opts.vecIndex ?? null,
+          embedder: opts.embedder ?? null,
+          maxLimit,
+        };
+
+        const res = await route(req, url, path, db, workspaceId, maxLimit, enrichDeps, onSync, opts.onEnrich);
+        status = res.status;
+        return res;
+      } catch (err) {
+        console.error("[api] handler error:", err);
+        status = 500;
+        return json({ error: "internal server error" }, 500);
+      } finally {
+        const ms = Date.now() - started;
+        console.log(`[api] ${req.method} ${path} ${status} ${ms}ms key=${keyName}`);
       }
-
-      // Health — no auth required
-      if (path === "/health") {
-        return json({ status: "ok", time: new Date().toISOString() });
-      }
-
-      // OpenAPI schema — no auth required
-      if (path === "/v1/schema") {
-        return json(openApiSchema());
-      }
-
-      // Auth check for all /v1/* routes
-      if (!checkAuth(req, apiKey)) {
-        return json({ error: "unauthorized" }, 401);
-      }
-
-      // Router
-      if (path === "/v1/search" && req.method === "GET") return handleEnhancedSearch(enrichDeps, url);
-      if (path === "/v1/messages" && req.method === "GET") return handleMessages(db, workspaceId, url);
-      if (path === "/v1/threads" && req.method === "GET") return handleThreads(db, workspaceId, url);
-      if (path === "/v1/channels" && req.method === "GET") return handleChannels(db, workspaceId, url);
-      if (path === "/v1/members" && req.method === "GET") return handleMembers(db, workspaceId, url);
-      if (path === "/v1/status" && req.method === "GET") return handleStatus(db, workspaceId);
-      if (path === "/v1/sync" && req.method === "POST") return handleSync(req, onSync);
-      if (path === "/v1/sql" && req.method === "GET") return handleSQL(db, url);
-
-      // Enrichment endpoints
-      if (path === "/v1/decisions" && req.method === "GET") return handleDecisions(enrichDeps, url);
-      if (path === "/v1/digests" && req.method === "GET") return handleDigests(enrichDeps, url);
-      if (path === "/v1/expertise" && req.method === "GET") return handleExpertise(enrichDeps, url);
-      if (path === "/v1/context" && req.method === "GET") return handleContext(enrichDeps, url);
-      if (path === "/v1/enrich" && req.method === "POST") return handleEnrichTrigger(opts?.onEnrich);
-
-      return json({ error: "not found" }, 404);
     },
 
     error(err) {
@@ -91,9 +103,32 @@ export function createServer(
   });
 }
 
+function route(
+  req: Request, url: URL, path: string,
+  db: Database, workspaceId: string, maxLimit: number,
+  enrichDeps: EnrichApiDeps, onSync: SyncCallback, onEnrich?: EnrichCallback,
+): Response | Promise<Response> {
+  if (path === "/v1/search" && req.method === "GET") return handleEnhancedSearch(enrichDeps, url);
+  if (path === "/v1/messages" && req.method === "GET") return handleMessages(db, workspaceId, maxLimit, url);
+  if (path === "/v1/threads" && req.method === "GET") return handleThreads(db, workspaceId, url);
+  if (path === "/v1/channels" && req.method === "GET") return handleChannels(db, workspaceId, url);
+  if (path === "/v1/members" && req.method === "GET") return handleMembers(db, workspaceId, url);
+  if (path === "/v1/status" && req.method === "GET") return handleStatus(db, workspaceId);
+  if (path === "/v1/sync" && req.method === "POST") return handleSync(req, onSync);
+
+  // Enrichment endpoints
+  if (path === "/v1/decisions" && req.method === "GET") return handleDecisions(enrichDeps, url);
+  if (path === "/v1/digests" && req.method === "GET") return handleDigests(enrichDeps, url);
+  if (path === "/v1/expertise" && req.method === "GET") return handleExpertise(enrichDeps, url);
+  if (path === "/v1/context" && req.method === "GET") return handleContext(enrichDeps, url);
+  if (path === "/v1/enrich" && req.method === "POST") return handleEnrichTrigger(onEnrich);
+
+  return json({ error: "not found" }, 404);
+}
+
 // ---- Handlers ----
 
-function handleMessages(db: Database, workspaceId: string, url: URL): Response {
+function handleMessages(db: Database, workspaceId: string, maxLimit: number, url: URL): Response {
   const p = url.searchParams;
   const hours = int(p.get("hours"), 0);
   const days  = int(p.get("days"), 0);
@@ -102,9 +137,7 @@ function handleMessages(db: Database, workspaceId: string, url: URL): Response {
   if (!since && hours) since = Math.floor(Date.now() / 1000) - hours * 3600;
   if (!since && days)  since = Math.floor(Date.now() / 1000) - days * 86400;
 
-  let until: number | undefined;
-  const untilStr = p.get("until");
-  if (untilStr) until = Math.floor(new Date(untilStr).getTime() / 1000);
+  const until = parseDateParam(p.get("until"));
 
   const messages = queryMessages(db, {
     workspaceId,
@@ -112,8 +145,8 @@ function handleMessages(db: Database, workspaceId: string, url: URL): Response {
     username: p.get("author") ?? undefined,
     since,
     until,
-    last: int(p.get("last"), 0) || undefined,
-    limit: int(p.get("limit"), 100),
+    last: int(p.get("last"), 0, maxLimit) || undefined,
+    limit: int(p.get("limit"), 100, maxLimit),
   });
 
   const threads = p.get("include_threads") === "true"
@@ -150,24 +183,15 @@ function handleEnrichTrigger(onEnrich?: EnrichCallback): Response {
 
 async function handleSync(req: Request, onSync: SyncCallback): Promise<Response> {
   let channel: string | undefined;
+  let full = false;
   try {
-    const body = await req.json() as { channel?: string };
+    const body = await req.json() as { channel?: string; full?: boolean };
     channel = body.channel;
+    full = body.full === true;
   } catch { /* empty body is fine */ }
 
-  onSync({ channels: channel ? [channel] : undefined });
-  return json({ status: "queued", channel: channel ?? null });
-}
-
-function handleSQL(db: Database, url: URL): Response {
-  const q = url.searchParams.get("q");
-  if (!q) return json({ error: "q is required" }, 400);
-  try {
-    const rows = execReadOnly(db, q);
-    return json({ rows, total: rows.length, warning: "This endpoint executes arbitrary read-only SQL. Do not expose without authentication." });
-  } catch (err) {
-    return json({ error: String(err) }, 400);
-  }
+  onSync({ channels: channel ? [channel] : undefined, full });
+  return json({ status: "queued", channel: channel ?? null, full });
 }
 
 function handleThreads(db: Database, workspaceId: string, url: URL): Response {
@@ -191,14 +215,22 @@ function handleThreads(db: Database, workspaceId: string, url: URL): Response {
   });
 }
 
-// ---- Helpers ----
+// ---- Auth ----
 
-function checkAuth(req: Request, apiKey: string): boolean {
-  if (!apiKey) return true; // no key configured = open
+/** Constant-time multi-key check. Returns the matched key (name) or null. */
+function authenticate(req: Request, apiKeys: ApiKey[]): { name: string } | null {
+  if (apiKeys.length === 0) return { name: "anon" }; // explicit no-auth mode (SLACKCRAWL_ALLOW_NO_AUTH)
   const auth = req.headers.get("Authorization") ?? "";
-  const expected = `Bearer ${apiKey}`;
-  if (auth.length !== expected.length) return false;
-  return timingSafeEqual(Buffer.from(auth), Buffer.from(expected));
+  const authBuf = Buffer.from(auth);
+  let matched: { name: string } | null = null;
+  // Check every key (no early exit) so timing doesn't reveal which key matched.
+  for (const k of apiKeys) {
+    const expected = Buffer.from(`Bearer ${k.key}`);
+    if (authBuf.length === expected.length && timingSafeEqual(authBuf, expected)) {
+      matched = { name: k.name };
+    }
+  }
+  return matched;
 }
 
 function openApiSchema() {
@@ -206,12 +238,12 @@ function openApiSchema() {
     openapi: "3.0.3",
     info: {
       title: "slackcrawl",
-      version: "0.1.0",
-      description: "Slack archive REST API for AI agents. Mirrors channels into SQLite with optional AI enrichment.",
+      version: "0.2.0",
+      description: "Slack archive REST API for AI agents. Mirrors public + private channels into SQLite with optional AI enrichment.",
     },
     paths: {
       "/health": {
-        get: { summary: "Health check", security: [], responses: { "200": { description: "OK" } } },
+        get: { summary: "Liveness check (body includes `ready` once the first sync completes)", security: [], responses: { "200": { description: "OK" } } },
       },
       "/v1/search": {
         get: {
@@ -268,15 +300,7 @@ function openApiSchema() {
         },
       },
       "/v1/status": { get: { summary: "DB and enrichment statistics" } },
-      "/v1/sync": { post: { summary: "Trigger background sync", requestBody: { content: { "application/json": { schema: { type: "object", properties: { channel: { type: "string" } } } } } } } },
-      "/v1/sql": {
-        get: {
-          summary: "Execute read-only SQL (use with caution)",
-          parameters: [
-            { name: "q", in: "query", required: true, schema: { type: "string" } },
-          ],
-        },
-      },
+      "/v1/sync": { post: { summary: "Trigger background sync", requestBody: { content: { "application/json": { schema: { type: "object", properties: { channel: { type: "string" }, full: { type: "boolean" } } } } } } } },
       "/v1/context": {
         get: {
           summary: "Bundled context for agents — the main endpoint",

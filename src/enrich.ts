@@ -38,13 +38,13 @@ export async function runEnrichment(
   result.summaries = await enrichThreadSummaries(db, cfg, claude);
 
   // Stage 3: Decision extraction (runs on new summaries)
-  result.decisions = await enrichDecisions(db, claude);
+  result.decisions = await enrichDecisions(db, claude, cfg.enrichMaxPerCycle);
 
   // Stage 4: Channel digests
   result.digests = await enrichChannelDigests(db, cfg, claude);
 
   // Stage 5: User profiles (once per day)
-  result.profiles = await enrichUserProfiles(db, claude);
+  result.profiles = await enrichUserProfiles(db, claude, cfg.enrichMaxPerCycle);
 
   console.log(`[enrich] done: ${result.embeddings} embeddings, ${result.summaries} summaries, ${result.decisions} decisions, ${result.digests} digests, ${result.profiles} profiles`);
   return result;
@@ -55,9 +55,10 @@ export async function runEnrichment(
 async function enrichEmbeddings(db: Database, cfg: Config, embedder: EmbeddingClient): Promise<number> {
   let total = 0;
   const batchSize = cfg.enrichBatch;
+  const maxPerCycle = cfg.enrichMaxPerCycle;
 
-  while (true) {
-    const batch = getUnembeddedMessages(db, batchSize);
+  while (total < maxPerCycle) {
+    const batch = getUnembeddedMessages(db, Math.min(batchSize, maxPerCycle - total));
     if (batch.length === 0) break;
 
     // Truncate long texts for embedding (8K tokens ≈ 32K chars max)
@@ -84,7 +85,7 @@ async function enrichEmbeddings(db: Database, cfg: Config, embedder: EmbeddingCl
 // ---- Stage 2: Thread Summaries ----
 
 async function enrichThreadSummaries(db: Database, cfg: Config, claude: ClaudeClient): Promise<number> {
-  const threads = getUnsummarizedThreads(db, cfg.enrichMinReplies);
+  const threads = getUnsummarizedThreads(db, cfg.enrichMinReplies, cfg.enrichMaxPerCycle);
   if (threads.length === 0) return 0;
 
   console.log(`[enrich] ${threads.length} threads to summarize`);
@@ -127,9 +128,9 @@ Include participant names when relevant. Return ONLY the summary, no preamble.`,
 
 // ---- Stage 3: Decision Extraction ----
 
-async function enrichDecisions(db: Database, claude: ClaudeClient): Promise<number> {
+async function enrichDecisions(db: Database, claude: ClaudeClient, maxPerCycle: number): Promise<number> {
   // Find thread summaries that haven't had decisions extracted yet
-  const rows = db.query<{ channel_id: string; thread_ts: string; summary: string }, []>(`
+  const rows = db.query<{ channel_id: string; thread_ts: string; summary: string }, [number]>(`
     SELECT ts.channel_id, ts.thread_ts, ts.summary
     FROM thread_summaries ts
     WHERE NOT EXISTS (
@@ -137,7 +138,8 @@ async function enrichDecisions(db: Database, claude: ClaudeClient): Promise<numb
       WHERE e.entity_type = 'decisions' AND e.entity_id = ts.channel_id || ':' || ts.thread_ts
     )
     ORDER BY ts.created_at DESC
-  `).all();
+    LIMIT ?
+  `).all(maxPerCycle);
 
   if (rows.length === 0) return 0;
   console.log(`[enrich] ${rows.length} threads for decision extraction`);
@@ -187,7 +189,7 @@ Return ONLY valid JSON, no markdown fences, no explanation.`,
 // ---- Stage 4: Channel Digests ----
 
 async function enrichChannelDigests(db: Database, cfg: Config, claude: ClaudeClient): Promise<number> {
-  const undigested = getUndigestedDates(db);
+  const undigested = getUndigestedDates(db, cfg.enrichMaxPerCycle);
   if (undigested.length === 0) return 0;
 
   console.log(`[enrich] ${undigested.length} channel-dates to digest`);
@@ -258,8 +260,8 @@ Format: first the markdown summary, then on a new line "TOPICS:" followed by com
 
 // ---- Stage 5: User Profiles ----
 
-async function enrichUserProfiles(db: Database, claude: ClaudeClient): Promise<number> {
-  const users = getUsersNeedingProfiles(db);
+async function enrichUserProfiles(db: Database, claude: ClaudeClient, maxPerCycle: number): Promise<number> {
+  const users = getUsersNeedingProfiles(db, maxPerCycle);
   if (users.length === 0) return 0;
 
   console.log(`[enrich] ${users.length} user profiles to generate`);

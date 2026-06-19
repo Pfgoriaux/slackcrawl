@@ -1,0 +1,15 @@
+.git
+.github
+node_modules
+*.md
+roadmap.md
+.env
+.env.*
+!.env.example
+slackcrawl
+slackcrawl-*
+*.db
+*.db-wal
+*.db-shm
+skill
+LICENSE

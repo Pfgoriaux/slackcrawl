@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { SIGNAL_FILTER } from "./db";
 
 // ---- Schema ----
 
@@ -165,16 +166,17 @@ export function getThreadSummaries(db: Database, channelId: string, since?: numb
 }
 
 /** Find threads that need summarization: 2+ replies, no summary or stale summary */
-export function getUnsummarizedThreads(db: Database, minReplies: number): { channel_id: string; thread_ts: string; reply_count: number; last_reply_ts: string }[] {
+export function getUnsummarizedThreads(db: Database, minReplies: number, limit = 500): { channel_id: string; thread_ts: string; reply_count: number; last_reply_ts: string }[] {
   return db.query<
     { channel_id: string; thread_ts: string; reply_count: number; last_reply_ts: string },
-    [number]
+    [number, number]
   >(`
     SELECT m.channel_id, m.ts as thread_ts, m.reply_count,
            (SELECT MAX(r.ts) FROM messages r WHERE r.channel_id = m.channel_id AND r.thread_ts = m.ts) as last_reply_ts
     FROM messages m
     WHERE m.reply_count >= ?
       AND m.thread_ts IS NULL
+      AND ${SIGNAL_FILTER}
       AND NOT EXISTS (
         SELECT 1 FROM thread_summaries ts
         WHERE ts.channel_id = m.channel_id AND ts.thread_ts = m.ts
@@ -190,7 +192,8 @@ export function getUnsummarizedThreads(db: Database, minReplies: number): { chan
           )
       )
     ORDER BY m.created_at DESC
-  `).all(minReplies);
+    LIMIT ?
+  `).all(minReplies, limit);
 }
 
 // ---- Decisions ----
@@ -315,11 +318,12 @@ export function getChannelDigests(db: Database, opts: {
 }
 
 /** Find dates with messages but no digest */
-export function getUndigestedDates(db: Database): { channel_id: string; date: string; msg_count: number }[] {
-  return db.query<{ channel_id: string; date: string; msg_count: number }, []>(`
+export function getUndigestedDates(db: Database, limit = 500): { channel_id: string; date: string; msg_count: number }[] {
+  return db.query<{ channel_id: string; date: string; msg_count: number }, [number]>(`
     SELECT m.channel_id, DATE(m.created_at, 'unixepoch') as date, COUNT(*) as msg_count
     FROM messages m
     WHERE m.thread_ts IS NULL
+      AND ${SIGNAL_FILTER}
       AND NOT EXISTS (
         SELECT 1 FROM channel_digests cd
         WHERE cd.channel_id = m.channel_id AND cd.date = DATE(m.created_at, 'unixepoch')
@@ -328,7 +332,8 @@ export function getUndigestedDates(db: Database): { channel_id: string; date: st
     GROUP BY m.channel_id, date
     HAVING msg_count >= 3
     ORDER BY date DESC
-  `).all();
+    LIMIT ?
+  `).all(limit);
 }
 
 // ---- Message embeddings ----
@@ -347,6 +352,7 @@ export function getUnembeddedMessages(db: Database, limit: number): { id: string
     SELECT m.id, m.text
     FROM messages m
     WHERE m.text IS NOT NULL AND m.text != ''
+      AND ${SIGNAL_FILTER}
       AND NOT EXISTS (SELECT 1 FROM message_embeddings me WHERE me.message_id = m.id)
     ORDER BY m.created_at DESC
     LIMIT ?
@@ -389,12 +395,13 @@ export function searchExpertise(db: Database, query: string, limit = 20): (UserP
   ).all(query, limit);
 }
 
-export function getUsersNeedingProfiles(db: Database): { user_id: string; username: string; message_count: number }[] {
-  return db.query<{ user_id: string; username: string; message_count: number }, []>(`
+export function getUsersNeedingProfiles(db: Database, limit = 200): { user_id: string; username: string; message_count: number }[] {
+  return db.query<{ user_id: string; username: string; message_count: number }, [number]>(`
     SELECT m.user_id, COALESCE(u.username, m.username) as username, COUNT(*) as message_count
     FROM messages m
     LEFT JOIN users u ON m.user_id = u.id
     WHERE m.user_id IS NOT NULL
+      AND ${SIGNAL_FILTER}
       AND (
         NOT EXISTS (SELECT 1 FROM user_profiles up WHERE up.user_id = m.user_id)
         OR (SELECT updated_at FROM user_profiles up2 WHERE up2.user_id = m.user_id) < unixepoch() - 86400
@@ -402,7 +409,8 @@ export function getUsersNeedingProfiles(db: Database): { user_id: string; userna
     GROUP BY m.user_id
     HAVING message_count >= 5
     ORDER BY message_count DESC
-  `).all();
+    LIMIT ?
+  `).all(limit);
 }
 
 // ---- Stats ----
