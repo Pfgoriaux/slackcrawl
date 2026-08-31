@@ -7,4 +7,3 @@ slackcrawl-*
 *.db
 *.db-wal
 *.db-shm
-.claude/
