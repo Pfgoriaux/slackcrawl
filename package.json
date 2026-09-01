@@ -5,9 +5,15 @@
     "start": "bun run src/index.ts serve",
     "dev": "bun --watch src/index.ts serve",
     "typecheck": "bunx tsc --noEmit",
-    "build": "bun build --compile --outfile=slackcrawl src/index.ts"
+    "build": "bun build --compile --outfile=slackcrawl src/index.ts",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "fix": "biome check --write .",
+    "prepare": "lefthook install || true"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@biomejs/biome": "^2.5.11",
+    "@types/bun": "latest",
+    "lefthook": "^2.1.12"
   }
 }
