@@ -19,6 +19,11 @@ export function insertDecision(db: Database, d: Omit<Decision, "id" | "created_a
   );
 }
 
+/** Remove all decisions for a thread (before re-extraction from an updated summary). */
+export function deleteDecisionsByThread(db: Database, channelId: string, threadTs: string) {
+  db.run("DELETE FROM decisions WHERE channel_id = ? AND thread_ts = ?", [channelId, threadTs]);
+}
+
 export function getDecisionsByThread(
   db: Database,
   channelId: string,

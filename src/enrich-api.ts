@@ -4,7 +4,7 @@ import type { Database } from "bun:sqlite";
 import type { Message } from "./db";
 import { getChannelByNameOrId, getThread, searchMessages } from "./db";
 import { type EnrichApiDeps, getQueryEmbedding } from "./enrich-api-shared";
-import { int, json, parseSince } from "./util";
+import { int, isFtsQueryError, json, parseSince } from "./util";
 
 export type { EnrichApiDeps };
 
@@ -39,13 +39,18 @@ export function handleDecisions(deps: EnrichApiDeps, url: URL): Response {
     });
 
     return json({ decisions, total: decisions.length });
-  } catch {
-    return json(
-      {
-        error: "Invalid search query. Avoid special characters like *, OR, NOT, NEAR.",
-      },
-      400,
-    );
+  } catch (err) {
+    // A user-provided FTS syntax error is a 400; anything else is a real server bug
+    // and must surface as a 500, not be masked as a client error.
+    if (isFtsQueryError(err)) {
+      return json(
+        {
+          error: "Invalid search query. Avoid special characters like *, OR, NOT, NEAR.",
+        },
+        400,
+      );
+    }
+    throw err;
   }
 }
 
@@ -100,7 +105,7 @@ export function handleExpertise(deps: EnrichApiDeps, url: URL): Response {
     return json({
       profile: {
         ...row,
-        expertise: row.expertise ? JSON.parse(row.expertise) : [],
+        expertise: safeParseJsonArray(row.expertise),
       },
     });
   }
@@ -130,12 +135,31 @@ export function handleExpertise(deps: EnrichApiDeps, url: URL): Response {
 
     const experts = results.map((r) => ({
       ...r,
-      expertise: r.expertise ? JSON.parse(r.expertise) : [],
+      expertise: safeParseJsonArray(r.expertise),
     }));
 
     return json({ experts, total: experts.length });
+  } catch (err) {
+    if (isFtsQueryError(err)) {
+      return json(
+        {
+          error: "Invalid search query. Avoid special characters like *, OR, NOT, NEAR.",
+        },
+        400,
+      );
+    }
+    throw err;
+  }
+}
+
+/** Parse a JSON-array column defensively — a corrupt row must not 500 the endpoint. */
+function safeParseJsonArray(raw: string | null): unknown[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
-    return json({ experts: [], total: 0 });
+    return [];
   }
 }
 
@@ -168,7 +192,8 @@ export async function handleEnhancedSearch(deps: EnrichApiDeps, url: URL): Promi
         since: parseSince(p),
         limit,
       });
-    } catch {
+    } catch (err) {
+      if (!isFtsQueryError(err)) throw err; // real DB errors must surface as 500
       // FTS5 syntax error — if keyword-only mode, return the error
       if (mode === "keyword") {
         return json(

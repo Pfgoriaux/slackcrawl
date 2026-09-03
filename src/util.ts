@@ -30,6 +30,23 @@ export function int(s: string | null, def: number, max?: number): number {
   return max !== undefined ? Math.max(1, Math.min(parsed, max)) : parsed;
 }
 
+/**
+ * True when a SQLite error is an FTS5 query-syntax error caused by the user's
+ * `q`/search string (operators like *, OR, unbalanced quotes). Distinguishing this
+ * matters: syntax errors are a 400, everything else is a 500.
+ */
+export function isFtsQueryError(err: unknown): boolean {
+  // SQLite's FTS5 query-syntax errors are all SQLITE_ERROR distinguished only by
+  // message. The known set: "fts5: syntax error near ...", "malformed MATCH
+  // expression: ...", "unterminated string", "unknown special query: ...".
+  return (
+    err instanceof Error &&
+    /fts5|malformed MATCH|syntax error near|unterminated string|unknown special query/i.test(
+      err.message,
+    )
+  );
+}
+
 export function parseSince(p: URLSearchParams): number | undefined {
   return parseDateParam(p.get("since"));
 }

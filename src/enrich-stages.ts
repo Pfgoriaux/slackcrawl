@@ -105,11 +105,16 @@ Format: first the markdown summary, then on a new line "TOPICS:" followed by com
 
 export async function enrichUserProfiles(
   db: Database,
+  cfg: Config,
   claude: ClaudeClient,
-  maxPerCycle: number,
 ): Promise<number> {
-  const users = getUsersNeedingProfiles(db, maxPerCycle);
+  const users = getUsersNeedingProfiles(db, cfg.enrichMaxPerCycle);
   if (users.length === 0) return 0;
+
+  // Channel lookup is loop-invariant: fetch once, index by id.
+  // (Previously this did a full getChannels() scan per user, plus O(channels)
+  // .find() lookups per message.)
+  const channelNameById = new Map(getChannels(db).map((c) => [c.id, c.name]));
 
   console.log(`[enrich] ${users.length} user profiles to generate`);
   let count = 0;
@@ -126,17 +131,11 @@ export async function enrichUserProfiles(
 
       // Get channels they're active in
       const channelIds = [...new Set(messages.map((m) => m.channel_id))];
-      const channels = getChannels(db);
-      const channelNames = channelIds
-        .map((id) => channels.find((c) => c.id === id)?.name)
-        .filter(Boolean);
+      const channelNames = channelIds.map((id) => channelNameById.get(id)).filter(Boolean);
 
       const msgSample = messages
         .slice(0, 50)
-        .map(
-          (m) =>
-            `[#${channels.find((c) => c.id === m.channel_id)?.name ?? m.channel_id}] ${m.text ?? ""}`,
-        )
+        .map((m) => `[#${channelNameById.get(m.channel_id) ?? m.channel_id}] ${m.text ?? ""}`)
         .join("\n");
 
       const { text, inputTokens, outputTokens } = await claude.complete(
@@ -159,7 +158,7 @@ Return ONLY valid JSON, no markdown fences. Max 10 expertise items.`,
         expertise: JSON.stringify(profile.expertise),
         summary: profile.summary || null,
       });
-      markEnriched(db, "user_profile", user.user_id, "claude", inputTokens + outputTokens);
+      markEnriched(db, "user_profile", user.user_id, cfg.claudeModel, inputTokens + outputTokens);
       count++;
     } catch (err) {
       console.error(`[enrich] user profile failed (${user.user_id}):`, err);

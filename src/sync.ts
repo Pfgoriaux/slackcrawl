@@ -5,6 +5,7 @@ import {
   getAllThreadRoots,
   getChannelByNameOrId,
   getStoredMessageIds,
+  getThreadMessageIds,
   markMessagesDeleted,
   updateLastSyncedTs,
   upsertChannel,
@@ -204,8 +205,23 @@ async function syncChannel(
         replyCount++;
       }
     } catch (err) {
-      // A thread that fails to fetch must NOT advance the watermark past it, or we'd
-      // never retry. Throw so the channel is marked failed and retried next cycle.
+      // Permanent failure: the thread is gone from Slack. Rethrowing here would fail
+      // the whole channel before tombstoning runs — and the dead root would never be
+      // tombstoned, so every later reconcile would fail the same way, forever.
+      // Tombstone the thread and move on.
+      if (isPermanentThreadError(err)) {
+        const ids = getThreadMessageIds(db, channelId, threadTs);
+        if (ids.length) {
+          markMessagesDeleted(db, ids);
+          console.log(
+            `[sync] #${channelName}: thread ${threadTs} gone from Slack — tombstoned ${ids.length} message(s)`,
+          );
+        }
+        continue;
+      }
+      // Transient failure: a thread that fails to fetch must NOT advance the watermark
+      // past it, or we'd never retry. Throw so the channel is marked failed and retried
+      // next cycle.
       throw new Error(`thread ${threadTs} in #${channelName}: ${err}`);
     }
   }
@@ -228,6 +244,13 @@ async function syncChannel(
   // Advance the watermark only after the whole channel (history + threads) succeeded.
   if (newestSeen) updateLastSyncedTs(db, channelId, newestSeen);
   console.log(`[sync] #${channelName}: ${msgCount} top-level, ${replyCount} replies`);
+}
+
+/** Slack error strings meaning "this thread no longer exists" — never worth retrying. */
+const PERMANENT_THREAD_ERRORS = ["thread_not_found", "message_not_found", "channel_not_found"];
+
+function isPermanentThreadError(err: unknown): boolean {
+  return err instanceof Error && PERMANENT_THREAD_ERRORS.some((e) => err.message.includes(e));
 }
 
 function upsertMsg(db: Database, workspaceId: string, channelId: string, msg: SlackMessage) {

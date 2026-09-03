@@ -43,7 +43,7 @@ export class ClaudeClient {
 
   private async post<T>(body: Record<string, unknown>): Promise<T> {
     return withRetry(async () => {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await doFetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: {
           "x-api-key": this.apiKey,
@@ -51,14 +51,18 @@ export class ClaudeClient {
           "content-type": "application/json",
         },
         body: JSON.stringify(body),
+        // Claude generations can be slow — 120s budget.
+        timeoutMs: 120_000,
       });
 
       if (res.status === 429) {
         const retryAfter = parseInt(res.headers.get("retry-after") ?? "30", 10);
         throw new RateLimitError(retryAfter * 1000);
       }
+      if (res.status >= 500) throw new TransientError(`Claude HTTP ${res.status}`);
       if (!res.ok) {
-        const text = await res.text();
+        // Permanent (4xx). Bound the message so error bodies can't spam logs.
+        const text = (await res.text()).slice(0, 500);
         throw new Error(`Claude HTTP ${res.status}: ${text}`);
       }
 
@@ -111,21 +115,23 @@ export class EmbeddingClient {
 
   private async post<T>(body: Record<string, unknown>): Promise<T> {
     return withRetry(async () => {
-      const res = await fetch("https://api.openai.com/v1/embeddings", {
+      const res = await doFetch("https://api.openai.com/v1/embeddings", {
         method: "POST",
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify(body),
+        timeoutMs: 60_000,
       });
 
       if (res.status === 429) {
         const retryAfter = parseInt(res.headers.get("retry-after") ?? "30", 10);
         throw new RateLimitError(retryAfter * 1000);
       }
+      if (res.status >= 500) throw new TransientError(`OpenAI HTTP ${res.status}`);
       if (!res.ok) {
-        const text = await res.text();
+        const text = (await res.text()).slice(0, 500);
         throw new Error(`OpenAI HTTP ${res.status}: ${text}`);
       }
 
@@ -151,6 +157,21 @@ class RateLimitError extends Error {
   }
 }
 
+/** Retriable failure: HTTP 5xx, network error, or request timeout. */
+class TransientError extends Error {}
+
+/** fetch with an explicit timeout; network/timeout failures become TransientError. */
+async function doFetch(url: string, init: RequestInit & { timeoutMs: number }): Promise<Response> {
+  const { timeoutMs, ...rest } = init;
+  try {
+    // Without an explicit timeout a hung connection can stall the whole
+    // enrichment pipeline indefinitely.
+    return await fetch(url, { ...rest, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (err) {
+    throw new TransientError(`fetch failed: ${err}`);
+  }
+}
+
 async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 6): Promise<T> {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
@@ -160,6 +181,14 @@ async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 6): Promise<T> {
         const wait = err.retryAfterMs + Math.random() * 5000;
         console.log(
           `[ai] rate limited, waiting ${Math.round(wait / 1000)}s (attempt ${attempt + 1}/${maxAttempts})`,
+        );
+        await sleep(wait);
+        continue;
+      }
+      if (err instanceof TransientError) {
+        const wait = Math.min(1000 * 2 ** attempt, 30_000) + Math.random() * 1000;
+        console.log(
+          `[ai] transient error (${err.message}), retrying in ${Math.round(wait / 1000)}s (attempt ${attempt + 1}/${maxAttempts})`,
         );
         await sleep(wait);
         continue;

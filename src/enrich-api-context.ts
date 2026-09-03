@@ -6,7 +6,7 @@ import { getChannelByNameOrId, type Message, searchMessages } from "./db";
 import type { EnrichApiDeps } from "./enrich-api-shared";
 import { getQueryEmbedding } from "./enrich-api-shared";
 import { getChannelDigests, getThreadSummary, queryDecisions } from "./enrich-db";
-import { int, json } from "./util";
+import { int, isFtsQueryError, json } from "./util";
 
 export async function handleContext(deps: EnrichApiDeps, url: URL): Promise<Response> {
   const p = url.searchParams;
@@ -63,8 +63,10 @@ export async function handleContext(deps: EnrichApiDeps, url: URL): Promise<Resp
       since,
       limit,
     });
-  } catch {
-    // FTS5 syntax error (user query had special operators) — fall back to empty
+  } catch (err) {
+    // FTS5 syntax error (user query had special operators) — fall back to empty;
+    // other errors are noteworthy and get logged, not swallowed silently.
+    if (!isFtsQueryError(err)) console.error("[context] keyword search failed:", err);
   }
 
   // 3. De-duplicate & merge
@@ -111,8 +113,9 @@ export async function handleContext(deps: EnrichApiDeps, url: URL): Promise<Resp
       query: topic,
       limit: 20,
     });
-  } catch {
+  } catch (err) {
     // FTS5 syntax error — skip decisions rather than fail the whole context call
+    if (!isFtsQueryError(err)) console.error("[context] decisions query failed:", err);
   }
 
   // 6. Digests for the time window
@@ -140,8 +143,9 @@ export async function handleContext(deps: EnrichApiDeps, url: URL): Promise<Resp
        ORDER BY rank LIMIT ?`,
       )
       .all(topic, 5);
-  } catch {
+  } catch (err) {
     // FTS5 may fail if no profiles exist yet or query has special chars
+    if (!isFtsQueryError(err)) console.error("[context] expertise query failed:", err);
   }
 
   // Estimate tokens (~4 chars per token)

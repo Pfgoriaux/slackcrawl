@@ -246,7 +246,7 @@ export function getActiveThreadRoots(
     .all(channelId, sinceUnix, sinceUnix);
 }
 
-/** Every thread root in a channel (used by full reconciliation). */
+/** Every live thread root in a channel (used by full reconciliation). */
 export function getAllThreadRoots(db: Database, channelId: string): ThreadRoot[] {
   return db
     .query<ThreadRoot, [string]>(
@@ -254,9 +254,20 @@ export function getAllThreadRoots(db: Database, channelId: string): ThreadRoot[]
             (SELECT MAX(r.ts) FROM messages r
               WHERE r.channel_id = m.channel_id AND (r.ts = m.ts OR r.thread_ts = m.ts)) AS stored_max_reply_ts
      FROM messages m
-     WHERE m.channel_id = ? AND m.reply_count > 0 AND m.thread_ts IS NULL`,
+     WHERE m.channel_id = ? AND m.reply_count > 0 AND m.thread_ts IS NULL
+       AND m.deleted_at IS NULL`,
     )
     .all(channelId);
+}
+
+/** Ids of all live messages of one thread (root + replies) — used to tombstone dead threads. */
+export function getThreadMessageIds(db: Database, channelId: string, threadTs: string): string[] {
+  return db
+    .query<{ id: string }, [string, string, string]>(
+      "SELECT id FROM messages WHERE channel_id = ? AND (ts = ? OR thread_ts = ?) AND deleted_at IS NULL",
+    )
+    .all(channelId, threadTs, threadTs)
+    .map((r) => r.id);
 }
 
 /** All non-deleted message ids currently stored for a channel (for deletion detection). */

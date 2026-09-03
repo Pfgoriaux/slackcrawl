@@ -7,6 +7,7 @@ import type { Config } from "./config";
 import type { Message } from "./db";
 import { getThread } from "./db";
 import {
+  deleteDecisionsByThread,
   getUnembeddedMessages,
   getUnsummarizedThreads,
   insertDecision,
@@ -47,13 +48,13 @@ export async function runEnrichment(
   result.summaries = await enrichThreadSummaries(db, cfg, claude);
 
   // Stage 3: Decision extraction (runs on new summaries)
-  result.decisions = await enrichDecisions(db, claude, cfg.enrichMaxPerCycle);
+  result.decisions = await enrichDecisions(db, cfg, claude);
 
   // Stage 4: Channel digests
   result.digests = await enrichChannelDigests(db, cfg, claude);
 
   // Stage 5: User profiles (once per day)
-  result.profiles = await enrichUserProfiles(db, claude, cfg.enrichMaxPerCycle);
+  result.profiles = await enrichUserProfiles(db, cfg, claude);
 
   console.log(
     `[enrich] done: ${result.embeddings} embeddings, ${result.summaries} summaries, ${result.decisions} decisions, ${result.digests} digests, ${result.profiles} profiles`,
@@ -153,12 +154,10 @@ Include participant names when relevant. Return ONLY the summary, no preamble.`,
 
 // ---- Stage 3: Decision Extraction ----
 
-async function enrichDecisions(
-  db: Database,
-  claude: ClaudeClient,
-  maxPerCycle: number,
-): Promise<number> {
-  // Find thread summaries that haven't had decisions extracted yet
+async function enrichDecisions(db: Database, cfg: Config, claude: ClaudeClient): Promise<number> {
+  // Find thread summaries that haven't had decisions extracted yet, or whose summary
+  // was regenerated (new replies) since the last extraction — otherwise the decisions
+  // table would silently contradict the current summary forever.
   const rows = db
     .query<{ channel_id: string; thread_ts: string; summary: string }, [number]>(`
     SELECT ts.channel_id, ts.thread_ts, ts.summary
@@ -166,11 +165,12 @@ async function enrichDecisions(
     WHERE NOT EXISTS (
       SELECT 1 FROM enrichment_log e
       WHERE e.entity_type = 'decisions' AND e.entity_id = ts.channel_id || ':' || ts.thread_ts
+        AND e.created_at >= ts.created_at
     )
     ORDER BY ts.created_at DESC
     LIMIT ?
   `)
-    .all(maxPerCycle);
+    .all(cfg.enrichMaxPerCycle);
 
   if (rows.length === 0) return 0;
   console.log(`[enrich] ${rows.length} threads for decision extraction`);
@@ -194,6 +194,9 @@ Return ONLY valid JSON, no markdown fences, no explanation.`,
         { decision: string; category: string; participants?: string[] }[]
       >(text.trim(), []);
 
+      // Re-extraction from an updated summary replaces, never duplicates.
+      deleteDecisionsByThread(db, row.channel_id, row.thread_ts);
+
       for (const d of decisions) {
         if (!d.decision || !d.category) continue;
         const validCategories = ["decision", "action_item", "conclusion", "commitment"];
@@ -214,7 +217,7 @@ Return ONLY valid JSON, no markdown fences, no explanation.`,
         db,
         "decisions",
         `${row.channel_id}:${row.thread_ts}`,
-        "claude",
+        cfg.claudeModel,
         inputTokens + outputTokens,
       );
     } catch (err) {

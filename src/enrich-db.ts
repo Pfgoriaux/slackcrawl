@@ -2,7 +2,12 @@
 // Split to respect the conventions.json file-size bound.
 
 export type { Decision } from "./enrich-db-decisions";
-export { getDecisionsByThread, insertDecision, queryDecisions } from "./enrich-db-decisions";
+export {
+  deleteDecisionsByThread,
+  getDecisionsByThread,
+  insertDecision,
+  queryDecisions,
+} from "./enrich-db-decisions";
 export type { ChannelDigest } from "./enrich-db-digests";
 export { getChannelDigests, getUndigestedDates, upsertChannelDigest } from "./enrich-db-digests";
 export { getAllEmbeddings, getUnembeddedMessages, upsertEmbedding } from "./enrich-db-embeddings";

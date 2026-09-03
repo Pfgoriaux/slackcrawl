@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { int, json, parseDateParam } from "./util";
+import { int, isFtsQueryError, json, parseDateParam } from "./util";
 
 describe("json()", () => {
   it("sends no CORS headers by default (agent API, not a browser one)", () => {
@@ -33,6 +33,22 @@ describe("int()", () => {
 
   it("returns parsed value unclamped when no max is given", () => {
     expect(int("7", 5)).toBe(7);
+  });
+});
+
+describe("isFtsQueryError()", () => {
+  it("recognizes every FTS5 query-syntax error SQLite emits", () => {
+    expect(isFtsQueryError(new Error('fts5: syntax error near "foo"'))).toBe(true);
+    expect(isFtsQueryError(new Error("malformed MATCH expression: [foo]"))).toBe(true);
+    expect(isFtsQueryError(new Error("unterminated string"))).toBe(true);
+    expect(isFtsQueryError(new Error('unknown special query: ""'))).toBe(true);
+  });
+
+  it("rejects non-FTS errors", () => {
+    expect(isFtsQueryError(new Error("database is locked"))).toBe(false);
+    expect(isFtsQueryError(new Error("no such table: messages"))).toBe(false);
+    expect(isFtsQueryError("not an error")).toBe(false);
+    expect(isFtsQueryError(null)).toBe(false);
   });
 });
 

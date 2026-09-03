@@ -715,7 +715,7 @@ Runs on the thread summary text, not the raw thread messages. This is intentiona
 
 ### Stage 4: Channel digests
 
-For each channel-day with 3+ top-level messages and no existing digest, Claude generates a markdown summary. The input includes the day's messages plus any thread summaries and decisions from earlier stages, giving the digest richer context than raw messages alone. Claude also extracts 3-8 topic tags for filtering.
+For each channel-day with 3+ top-level messages and no existing digest, Claude generates a markdown summary. The input includes the day's messages plus thread summaries from earlier stages, giving the digest richer context than raw messages alone. Claude also extracts 3-8 topic tags for filtering.
 
 ### Stage 5: User profiles
 
@@ -725,8 +725,8 @@ Runs once per day. Users with 5+ messages get an expertise profile generated fro
 
 - **Idempotent**: every stage tracks what has been processed in `enrichment_log`. Interrupt at any point and it picks up where it left off.
 - **Incremental**: only new/changed data is processed. Re-running enrichment on an already-enriched database is nearly free.
-- **Cascading**: later stages use output from earlier ones. Thread summaries feed into decision extraction and channel digests. This means the AI works on progressively refined data, not raw noise.
-- **Rate-limited**: both Claude and OpenAI clients enforce minimum intervals between calls (500ms and 200ms respectively) and retry with exponential backoff on 429 responses.
+- **Cascading**: later stages use output from earlier ones. Thread summaries feed into decision extraction and channel digests. This means the AI works on progressively refined data, not raw noise. When a thread is re-summarized (new replies), its decisions are re-extracted — replacing the old rows, never duplicating them.
+- **Rate-limited**: both Claude and OpenAI clients enforce minimum intervals between calls (500ms and 200ms respectively), honor `Retry-After` on 429 responses, and retry 5xx/network/timeout failures with exponential backoff. All outbound HTTP calls (Slack included) have an explicit timeout so a hung connection can never stall a sync or enrichment run silently.
 
 ## Environment variables
 
@@ -776,6 +776,7 @@ The schema is created regardless of whether API keys are set. The tables just st
 - **The database file is the sensitive artifact.** Every message is stored in full, including `raw_json` (the raw Slack payload) with user emails from `users.list`. Treat `SLACKCRAWL_DB_PATH` (`$DATA_DIR/slackcrawl.db` in Docker) like credentials: restrict filesystem permissions (`chmod 600` / a dedicated volume), include it — and its `.db-wal` sidecar — in your backup threat model.
 - **No CORS by default.** `json()` responses carry no `Access-Control-Allow-Origin` header unless you explicitly set `SLACKCRAWL_CORS_ORIGIN`. This is an API for agents, not browsers; the absence of a wildcard default means a leaked key cannot be used cross-origin from a browser to read your archive.
 - Auth is fail-closed: serve refuses to start with no API key unless `SLACKCRAWL_ALLOW_NO_AUTH=true`. Keys are validated at load (placeholder values rejected, minimum 16 chars) and compared in constant time.
+- **AI enrichment is a trust boundary.** Slack message text is sent verbatim to Anthropic/OpenAI, and the resulting summaries/decisions are served back to agents via the API. Everything any Slack member writes can therefore influence prompts and downstream agent behavior (classic indirect prompt injection). Anyone who can post in a synced channel must be treated as trusted input; do not auto-execute agent actions off decisions/digests without a review step.
 
 ## License
 

@@ -1,6 +1,6 @@
 {
   "name": "slackcrawl",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "scripts": {
     "start": "bun run src/index.ts serve",
     "dev": "bun --watch src/index.ts serve",
@@ -12,6 +12,8 @@
     "fix": "biome check --write .",
     "prepare": "lefthook install || true"
   },
+  "license": "MIT",
+  "repository": "github:Pfgoriaux/slackcrawl",
   "devDependencies": {
     "@biomejs/biome": "^2.5.11",
     "@types/bun": "latest",
