@@ -13,6 +13,12 @@ All notable changes to slackcrawl. Format loosely follows
 - `SLACKCRAWL_SYNC_INTERVAL=0` (continuous re-sync) is now rejected at
   config load instead of hammering the Slack API.
 
+### Security
+- No CORS by default: responses carry no `Access-Control-Allow-Origin`
+  unless `SLACKCRAWL_CORS_ORIGIN` is set (previously defaulted to `*`).
+  README gains a security section covering DB-file sensitivity
+  (`raw_json`, user emails) and auth posture.
+
 ### Added
 - Test suite (`bun test`) and CI (typecheck + lint + test + build on
   push/PR).

@@ -1,15 +1,21 @@
 // Shared helpers used across API route handlers.
 
+/**
+ * Build a JSON response. CORS headers are added ONLY when
+ * SLACKCRAWL_CORS_ORIGIN is set — there is no wildcard default. This is an
+ * agent API; browsers are not an expected client, and a permissive default
+ * means any website could read responses cross-origin if a key leaks into
+ * a browser context. Set the env var explicitly when you do want CORS.
+ */
 export function json(data: unknown, status = 200): Response {
-  return new Response(data === null ? null : JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": process.env.SLACKCRAWL_CORS_ORIGIN ?? "*",
-      "Access-Control-Allow-Headers": "Authorization, Content-Type",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    },
-  });
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const origin = process.env.SLACKCRAWL_CORS_ORIGIN;
+  if (origin) {
+    headers["Access-Control-Allow-Origin"] = origin;
+    headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type";
+    headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
+  }
+  return new Response(data === null ? null : JSON.stringify(data), { status, headers });
 }
 
 /**

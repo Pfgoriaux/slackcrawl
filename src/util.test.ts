@@ -1,5 +1,21 @@
 import { describe, expect, it } from "bun:test";
-import { int, parseDateParam } from "./util";
+import { int, json, parseDateParam } from "./util";
+
+describe("json()", () => {
+  it("sends no CORS headers by default (agent API, not a browser one)", () => {
+    delete process.env.SLACKCRAWL_CORS_ORIGIN;
+    const res = json({ ok: true });
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  it("sends CORS headers only when SLACKCRAWL_CORS_ORIGIN is set", () => {
+    process.env.SLACKCRAWL_CORS_ORIGIN = "https://app.example.com";
+    const res = json({ ok: true });
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("https://app.example.com");
+    expect(res.headers.get("Access-Control-Allow-Methods")).toBe("GET, POST, OPTIONS");
+    delete process.env.SLACKCRAWL_CORS_ORIGIN;
+  });
+});
 
 describe("int()", () => {
   it("returns default when absent or invalid", () => {

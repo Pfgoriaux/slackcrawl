@@ -754,7 +754,7 @@ Runs once per day. Users with 5+ messages get an expertise profile generated fro
 | `SLACKCRAWL_ENRICH_BATCH` | `100` | How many messages to embed per API call |
 | `SLACKCRAWL_ENRICH_MIN_REPLIES` | `2` | Minimum thread replies before summarizing |
 | `SLACKCRAWL_ENRICH_MAX_PER_CYCLE` | `500` | Cap on items processed per enrichment stage per cycle (bounds cost/time; the rest is picked up next cycle). |
-| `SLACKCRAWL_CORS_ORIGIN` | `*` | CORS `Access-Control-Allow-Origin` header value |
+| `SLACKCRAWL_CORS_ORIGIN` | _(unset — no CORS headers)_ | Value for `Access-Control-Allow-Origin`. Only set this if a browser client needs access; there is no wildcard default |
 
 ## DB tables
 
@@ -770,6 +770,12 @@ Enrichment adds six more tables, created automatically when the DB opens:
 - `user_profiles` — expertise profiles with topic/confidence/channel data, with an FTS5 index
 
 The schema is created regardless of whether API keys are set. The tables just stay empty until you run enrichment.
+
+## Security notes
+
+- **The database file is the sensitive artifact.** Every message is stored in full, including `raw_json` (the raw Slack payload) with user emails from `users.list`. Treat `SLACKCRAWL_DB_PATH` (`$DATA_DIR/slackcrawl.db` in Docker) like credentials: restrict filesystem permissions (`chmod 600` / a dedicated volume), include it — and its `.db-wal` sidecar — in your backup threat model.
+- **No CORS by default.** `json()` responses carry no `Access-Control-Allow-Origin` header unless you explicitly set `SLACKCRAWL_CORS_ORIGIN`. This is an API for agents, not browsers; the absence of a wildcard default means a leaked key cannot be used cross-origin from a browser to read your archive.
+- Auth is fail-closed: serve refuses to start with no API key unless `SLACKCRAWL_ALLOW_NO_AUTH=true`. Keys are validated at load (placeholder values rejected, minimum 16 chars) and compared in constant time.
 
 ## License
 
