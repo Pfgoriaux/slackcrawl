@@ -161,9 +161,15 @@ function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
 }
 
-/** Parse a Go-style duration ("5m", "1h", "30s", "500ms"). Returns `def` on malformed input. */
+/**
+ * Parse a Go-style duration ("5m", "1h", "30s", "500ms"). Returns `def` on malformed
+ * input. The bare string "0" is accepted (means 0 — used to disable
+ * SLACKCRAWL_RECONCILE_INTERVAL; rejected separately for intervals where 0 makes
+ * no sense, like SYNC_INTERVAL).
+ */
 function parseDuration(s: string | undefined, def: number): number {
   if (!s) return def;
+  if (s.trim() === "0") return 0;
   const m = s.trim().match(/^(\d+)(ms|s|m|h)$/);
   if (!m) {
     console.warn(`[config] malformed duration "${s}", using default ${def}ms`);
