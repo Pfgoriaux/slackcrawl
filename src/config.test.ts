@@ -4,6 +4,7 @@ import { loadConfig } from "./config";
 afterEach(() => {
   delete process.env.SLACK_BOT_TOKEN;
   delete process.env.SLACKCRAWL_SYNC_INTERVAL;
+  delete process.env.SLACKCRAWL_RECONCILE_INTERVAL;
   delete process.env.SLACKCRAWL_API_KEY;
 });
 
@@ -24,6 +25,12 @@ describe("loadConfig()", () => {
     process.env.SLACK_BOT_TOKEN = "xoxb-test-token";
     process.env.SLACKCRAWL_API_KEY = "shortkey";
     expect(() => loadConfig()).toThrow(/too short/);
+  });
+
+  it("accepts bare 0 to disable reconciliation", () => {
+    process.env.SLACK_BOT_TOKEN = "xoxb-test-token";
+    process.env.SLACKCRAWL_RECONCILE_INTERVAL = "0";
+    expect(loadConfig().reconcileIntervalMs).toBe(0);
   });
 
   it("parses named API keys", () => {
