@@ -7,3 +7,4 @@ slackcrawl-*
 *.db
 *.db-wal
 *.db-shm
+*.bun-build

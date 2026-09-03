@@ -4,6 +4,7 @@
   "scripts": {
     "start": "bun run src/index.ts serve",
     "dev": "bun --watch src/index.ts serve",
+    "test": "bun test",
     "typecheck": "bunx tsc --noEmit",
     "build": "bun build --compile --outfile=slackcrawl src/index.ts",
     "lint": "biome check .",

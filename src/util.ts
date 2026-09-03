@@ -20,7 +20,7 @@ export function json(data: unknown, status = 200): Response {
 export function int(s: string | null, def: number, max?: number): number {
   if (!s) return def;
   const parsed = parseInt(s, 10);
-  if (isNaN(parsed)) return def;
+  if (Number.isNaN(parsed)) return def;
   return max !== undefined ? Math.max(1, Math.min(parsed, max)) : parsed;
 }
 
@@ -32,5 +32,5 @@ export function parseSince(p: URLSearchParams): number | undefined {
 export function parseDateParam(s: string | null): number | undefined {
   if (!s) return undefined;
   const t = new Date(s).getTime();
-  return isNaN(t) ? undefined : Math.floor(t / 1000);
+  return Number.isNaN(t) ? undefined : Math.floor(t / 1000);
 }

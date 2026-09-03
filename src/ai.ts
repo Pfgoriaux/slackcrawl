@@ -9,12 +9,13 @@ export class ClaudeClient {
     private readonly model: string,
   ) {}
 
-  async complete(prompt: string, system?: string): Promise<{ text: string; inputTokens: number; outputTokens: number }> {
+  async complete(
+    prompt: string,
+    system?: string,
+  ): Promise<{ text: string; inputTokens: number; outputTokens: number }> {
     await this.rateLimit();
 
-    const messages: { role: string; content: string }[] = [
-      { role: "user", content: prompt },
-    ];
+    const messages: { role: string; content: string }[] = [{ role: "user", content: prompt }];
 
     const body: Record<string, unknown> = {
       model: this.model,
@@ -53,7 +54,7 @@ export class ClaudeClient {
       });
 
       if (res.status === 429) {
-        const retryAfter = parseInt(res.headers.get("retry-after") ?? "30");
+        const retryAfter = parseInt(res.headers.get("retry-after") ?? "30", 10);
         throw new RateLimitError(retryAfter * 1000);
       }
       if (!res.ok) {
@@ -120,7 +121,7 @@ export class EmbeddingClient {
       });
 
       if (res.status === 429) {
-        const retryAfter = parseInt(res.headers.get("retry-after") ?? "30");
+        const retryAfter = parseInt(res.headers.get("retry-after") ?? "30", 10);
         throw new RateLimitError(retryAfter * 1000);
       }
       if (!res.ok) {
@@ -157,7 +158,9 @@ async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 6): Promise<T> {
     } catch (err) {
       if (err instanceof RateLimitError) {
         const wait = err.retryAfterMs + Math.random() * 5000;
-        console.log(`[ai] rate limited, waiting ${Math.round(wait / 1000)}s (attempt ${attempt + 1}/${maxAttempts})`);
+        console.log(
+          `[ai] rate limited, waiting ${Math.round(wait / 1000)}s (attempt ${attempt + 1}/${maxAttempts})`,
+        );
         await sleep(wait);
         continue;
       }

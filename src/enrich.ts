@@ -2,17 +2,20 @@
 // Runs after each sync: embeddings → summaries → decisions → digests → profiles.
 
 import type { Database } from "bun:sqlite";
-import type { Config } from "./config";
 import type { ClaudeClient, EmbeddingClient } from "./ai";
+import type { Config } from "./config";
 import type { Message } from "./db";
-import { getThread, getChannels, queryMessages } from "./db";
+import { getThread } from "./db";
 import {
-  getUnembeddedMessages, upsertEmbedding, markEnriched,
-  getUnsummarizedThreads, upsertThreadSummary, getThreadSummary,
-  insertDecision, getDecisionsByThread,
-  getUndigestedDates, upsertChannelDigest, getThreadSummaries,
-  getUsersNeedingProfiles, upsertUserProfile,
+  getUnembeddedMessages,
+  getUnsummarizedThreads,
+  insertDecision,
+  markEnriched,
+  upsertEmbedding,
+  upsertThreadSummary,
 } from "./enrich-db";
+import { parseJSON } from "./enrich-helpers";
+import { enrichChannelDigests, enrichUserProfiles } from "./enrich-stages";
 
 export interface EnrichResult {
   embeddings: number;
@@ -29,7 +32,13 @@ export async function runEnrichment(
   embedder: EmbeddingClient,
 ): Promise<EnrichResult> {
   console.log("[enrich] starting enrichment pipeline");
-  const result: EnrichResult = { embeddings: 0, summaries: 0, decisions: 0, digests: 0, profiles: 0 };
+  const result: EnrichResult = {
+    embeddings: 0,
+    summaries: 0,
+    decisions: 0,
+    digests: 0,
+    profiles: 0,
+  };
 
   // Stage 1: Embeddings
   result.embeddings = await enrichEmbeddings(db, cfg, embedder);
@@ -46,13 +55,19 @@ export async function runEnrichment(
   // Stage 5: User profiles (once per day)
   result.profiles = await enrichUserProfiles(db, claude, cfg.enrichMaxPerCycle);
 
-  console.log(`[enrich] done: ${result.embeddings} embeddings, ${result.summaries} summaries, ${result.decisions} decisions, ${result.digests} digests, ${result.profiles} profiles`);
+  console.log(
+    `[enrich] done: ${result.embeddings} embeddings, ${result.summaries} summaries, ${result.decisions} decisions, ${result.digests} digests, ${result.profiles} profiles`,
+  );
   return result;
 }
 
 // ---- Stage 1: Embeddings ----
 
-async function enrichEmbeddings(db: Database, cfg: Config, embedder: EmbeddingClient): Promise<number> {
+async function enrichEmbeddings(
+  db: Database,
+  cfg: Config,
+  embedder: EmbeddingClient,
+): Promise<number> {
   let total = 0;
   const batchSize = cfg.enrichBatch;
   const maxPerCycle = cfg.enrichMaxPerCycle;
@@ -84,7 +99,11 @@ async function enrichEmbeddings(db: Database, cfg: Config, embedder: EmbeddingCl
 
 // ---- Stage 2: Thread Summaries ----
 
-async function enrichThreadSummaries(db: Database, cfg: Config, claude: ClaudeClient): Promise<number> {
+async function enrichThreadSummaries(
+  db: Database,
+  cfg: Config,
+  claude: ClaudeClient,
+): Promise<number> {
   const threads = getUnsummarizedThreads(db, cfg.enrichMinReplies, cfg.enrichMaxPerCycle);
   if (threads.length === 0) return 0;
 
@@ -114,7 +133,13 @@ Include participant names when relevant. Return ONLY the summary, no preamble.`,
         message_count: messages.length,
         last_reply_ts: t.last_reply_ts,
       });
-      markEnriched(db, "thread_summary", `${t.channel_id}:${t.thread_ts}`, cfg.claudeModel, inputTokens + outputTokens);
+      markEnriched(
+        db,
+        "thread_summary",
+        `${t.channel_id}:${t.thread_ts}`,
+        cfg.claudeModel,
+        inputTokens + outputTokens,
+      );
       count++;
 
       if (count % 10 === 0) console.log(`[enrich] summarized ${count}/${threads.length} threads`);
@@ -128,9 +153,14 @@ Include participant names when relevant. Return ONLY the summary, no preamble.`,
 
 // ---- Stage 3: Decision Extraction ----
 
-async function enrichDecisions(db: Database, claude: ClaudeClient, maxPerCycle: number): Promise<number> {
+async function enrichDecisions(
+  db: Database,
+  claude: ClaudeClient,
+  maxPerCycle: number,
+): Promise<number> {
   // Find thread summaries that haven't had decisions extracted yet
-  const rows = db.query<{ channel_id: string; thread_ts: string; summary: string }, [number]>(`
+  const rows = db
+    .query<{ channel_id: string; thread_ts: string; summary: string }, [number]>(`
     SELECT ts.channel_id, ts.thread_ts, ts.summary
     FROM thread_summaries ts
     WHERE NOT EXISTS (
@@ -139,7 +169,8 @@ async function enrichDecisions(db: Database, claude: ClaudeClient, maxPerCycle: 
     )
     ORDER BY ts.created_at DESC
     LIMIT ?
-  `).all(maxPerCycle);
+  `)
+    .all(maxPerCycle);
 
   if (rows.length === 0) return 0;
   console.log(`[enrich] ${rows.length} threads for decision extraction`);
@@ -159,7 +190,9 @@ If there are no decisions or action items, return an empty array [].
 Return ONLY valid JSON, no markdown fences, no explanation.`,
       );
 
-      const decisions = parseJSON<{ decision: string; category: string; participants?: string[] }[]>(text.trim(), []);
+      const decisions = parseJSON<
+        { decision: string; category: string; participants?: string[] }[]
+      >(text.trim(), []);
 
       for (const d of decisions) {
         if (!d.decision || !d.category) continue;
@@ -177,139 +210,18 @@ Return ONLY valid JSON, no markdown fences, no explanation.`,
         count++;
       }
 
-      markEnriched(db, "decisions", `${row.channel_id}:${row.thread_ts}`, "claude", inputTokens + outputTokens);
-    } catch (err) {
-      console.error(`[enrich] decision extraction failed (${row.channel_id}:${row.thread_ts}):`, err);
-    }
-  }
-
-  return count;
-}
-
-// ---- Stage 4: Channel Digests ----
-
-async function enrichChannelDigests(db: Database, cfg: Config, claude: ClaudeClient): Promise<number> {
-  const undigested = getUndigestedDates(db, cfg.enrichMaxPerCycle);
-  if (undigested.length === 0) return 0;
-
-  console.log(`[enrich] ${undigested.length} channel-dates to digest`);
-  let count = 0;
-
-  for (const { channel_id, date, msg_count } of undigested) {
-    try {
-      const dayStart = Math.floor(new Date(date + "T00:00:00Z").getTime() / 1000);
-      const dayEnd = dayStart + 86400;
-
-      const messages = queryMessages(db, {
-        channelId: channel_id,
-        since: dayStart,
-        until: dayEnd,
-        limit: 200,
-      });
-
-      if (messages.length < 3) continue;
-
-      // Gather any existing thread summaries for context
-      const summaries = getThreadSummaries(db, channel_id, dayStart);
-      const summaryContext = summaries.length > 0
-        ? `\n\nThread summaries from this day:\n${summaries.map((s) => `- ${s.summary}`).join("\n")}`
-        : "";
-
-      const msgText = messages
-        .map((m) => `[${m.username ?? "unknown"}] ${m.text ?? ""}`)
-        .join("\n");
-
-      const participants = new Set(messages.map((m) => m.username).filter(Boolean));
-      const threadCount = new Set(messages.filter((m) => m.thread_ts).map((m) => m.thread_ts)).size;
-
-      const { text, inputTokens, outputTokens } = await claude.complete(
-        `Channel messages for ${date}:\n${msgText}${summaryContext}`,
-        `You are creating a daily digest for a Slack channel. Summarize the day's activity in markdown format.
-Include:
-- Key topics discussed
-- Important decisions or conclusions
-- Notable threads
-
-Return the summary in markdown (2-4 paragraphs). Also extract 3-8 key topic tags.
-Format: first the markdown summary, then on a new line "TOPICS:" followed by comma-separated tags.`,
+      markEnriched(
+        db,
+        "decisions",
+        `${row.channel_id}:${row.thread_ts}`,
+        "claude",
+        inputTokens + outputTokens,
       );
-
-      const [summary, topicLine] = splitTopics(text.trim());
-      const keyTopics = topicLine
-        ? topicLine.split(",").map((t) => t.trim()).filter(Boolean)
-        : [];
-
-      upsertChannelDigest(db, {
-        channel_id,
-        date,
-        summary,
-        key_topics: JSON.stringify(keyTopics),
-        message_count: msg_count,
-        thread_count: threadCount,
-        participant_count: participants.size,
-      });
-      markEnriched(db, "digest", `${channel_id}:${date}`, cfg.claudeModel, inputTokens + outputTokens);
-      count++;
     } catch (err) {
-      console.error(`[enrich] digest failed (${channel_id}:${date}):`, err);
-    }
-  }
-
-  return count;
-}
-
-// ---- Stage 5: User Profiles ----
-
-async function enrichUserProfiles(db: Database, claude: ClaudeClient, maxPerCycle: number): Promise<number> {
-  const users = getUsersNeedingProfiles(db, maxPerCycle);
-  if (users.length === 0) return 0;
-
-  console.log(`[enrich] ${users.length} user profiles to generate`);
-  let count = 0;
-
-  for (const user of users) {
-    try {
-      // Get recent messages for this user
-      const messages = queryMessages(db, {
-        username: user.username,
-        limit: 100,
-      });
-
-      if (messages.length < 5) continue;
-
-      // Get channels they're active in
-      const channelIds = [...new Set(messages.map((m) => m.channel_id))];
-      const channels = getChannels(db);
-      const channelNames = channelIds
-        .map((id) => channels.find((c) => c.id === id)?.name)
-        .filter(Boolean);
-
-      const msgSample = messages
-        .slice(0, 50)
-        .map((m) => `[#${channels.find((c) => c.id === m.channel_id)?.name ?? m.channel_id}] ${m.text ?? ""}`)
-        .join("\n");
-
-      const { text, inputTokens, outputTokens } = await claude.complete(
-        `User: ${user.username}\nActive channels: ${channelNames.join(", ")}\n\nRecent messages:\n${msgSample}`,
-        `Analyze this Slack user's messages and create an expertise profile.
-Return JSON with:
-- "expertise": array of {topic: string, confidence: number (0-1), channels: string[]}
-- "summary": 1-2 sentence description of their role/expertise
-
-Return ONLY valid JSON, no markdown fences. Max 10 expertise items.`,
+      console.error(
+        `[enrich] decision extraction failed (${row.channel_id}:${row.thread_ts}):`,
+        err,
       );
-
-      const profile = parseJSON<{ expertise: unknown[]; summary: string }>(text.trim(), { expertise: [], summary: "" });
-
-      upsertUserProfile(db, {
-        user_id: user.user_id,
-        expertise: JSON.stringify(profile.expertise),
-        summary: profile.summary || null,
-      });
-      markEnriched(db, "user_profile", user.user_id, "claude", inputTokens + outputTokens);
-      count++;
-    } catch (err) {
-      console.error(`[enrich] user profile failed (${user.user_id}):`, err);
     }
   }
 
@@ -319,23 +231,5 @@ Return ONLY valid JSON, no markdown fences. Max 10 expertise items.`,
 // ---- Helpers ----
 
 function formatThread(messages: Message[]): string {
-  return messages
-    .map((m) => `[${m.username ?? "unknown"}] ${m.text ?? ""}`)
-    .join("\n");
-}
-
-function parseJSON<T>(text: string, fallback: T): T {
-  try {
-    // Strip markdown code fences if present
-    const cleaned = text.replace(/^```(?:json)?\n?/m, "").replace(/\n?```$/m, "");
-    return JSON.parse(cleaned);
-  } catch {
-    return fallback;
-  }
-}
-
-function splitTopics(text: string): [string, string] {
-  const idx = text.lastIndexOf("TOPICS:");
-  if (idx === -1) return [text, ""];
-  return [text.slice(0, idx).trim(), text.slice(idx + 7).trim()];
+  return messages.map((m) => `[${m.username ?? "unknown"}] ${m.text ?? ""}`).join("\n");
 }

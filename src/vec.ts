@@ -16,7 +16,9 @@ export class VecIndex {
   private dims = 0;
   private vectors: Float32Array = new Float32Array(0); // contiguous: [vec0...vec1...vecN]
 
-  get size() { return this.ids.length; }
+  get size() {
+    return this.ids.length;
+  }
 
   /** Load all embeddings from DB and build in-memory index. */
   load(db: Database) {
@@ -85,20 +87,31 @@ export class VecIndex {
       if (filled < k) {
         // Insert in sorted (descending) position.
         let j = filled - 1;
-        while (j >= 0 && topScore[j] < dot) { topScore[j + 1] = topScore[j]; topIdx[j + 1] = topIdx[j]; j--; }
-        topScore[j + 1] = dot; topIdx[j + 1] = i;
+        while (j >= 0 && topScore[j] < dot) {
+          topScore[j + 1] = topScore[j];
+          topIdx[j + 1] = topIdx[j];
+          j--;
+        }
+        topScore[j + 1] = dot;
+        topIdx[j + 1] = i;
         filled++;
         if (filled === k) minScore = topScore[k - 1];
       } else if (dot > minScore) {
         let j = k - 2;
-        while (j >= 0 && topScore[j] < dot) { topScore[j + 1] = topScore[j]; topIdx[j + 1] = topIdx[j]; j--; }
-        topScore[j + 1] = dot; topIdx[j + 1] = i;
+        while (j >= 0 && topScore[j] < dot) {
+          topScore[j + 1] = topScore[j];
+          topIdx[j + 1] = topIdx[j];
+          j--;
+        }
+        topScore[j + 1] = dot;
+        topIdx[j + 1] = i;
         minScore = topScore[k - 1];
       }
     }
 
     const out: { messageId: string; score: number }[] = new Array(filled);
-    for (let i = 0; i < filled; i++) out[i] = { messageId: this.ids[topIdx[i]], score: topScore[i] };
+    for (let i = 0; i < filled; i++)
+      out[i] = { messageId: this.ids[topIdx[i]], score: topScore[i] };
     return out;
   }
 

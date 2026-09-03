@@ -5,19 +5,19 @@ export interface ApiKey {
 
 export interface Config {
   slackToken: string;
-  apiKeys: ApiKey[];      // empty = no auth (only allowed with allowNoAuth)
+  apiKeys: ApiKey[]; // empty = no auth (only allowed with allowNoAuth)
   allowNoAuth: boolean;
-  channels: string[];     // empty = all channels bot is in
+  channels: string[]; // empty = all channels bot is in
   syncIntervalMs: number;
   reconcileIntervalMs: number; // 0 = disabled
   dbPath: string;
   port: number;
   host: string;
-  maxLimit: number;       // hard cap on any `limit`/`last` query param
+  maxLimit: number; // hard cap on any `limit`/`last` query param
   threadRepollDays: number; // re-poll replies for threads active within N days each cycle
   // Slack pacing
   slackMinIntervalMs: number; // min ms between Slack API calls (global)
-  slackHistoryLimit: number;  // page size for conversations.history / .replies
+  slackHistoryLimit: number; // page size for conversations.history / .replies
   // AI enrichment
   claudeApiKey: string;
   openaiApiKey: string;
@@ -26,15 +26,10 @@ export interface Config {
   enrichEnabled: boolean;
   enrichBatch: number;
   enrichMinReplies: number;
-  enrichMaxPerCycle: number;  // cap items processed per stage per enrichment run
+  enrichMaxPerCycle: number; // cap items processed per stage per enrichment run
 }
 
-const PLACEHOLDER_KEYS = new Set([
-  "your-secret-api-key",
-  "your-secret",
-  "my-secret",
-  "changeme",
-]);
+const PLACEHOLDER_KEYS = new Set(["your-secret-api-key", "your-secret", "my-secret", "changeme"]);
 
 export function loadConfig(): Config {
   const slackToken = process.env.SLACK_BOT_TOKEN;
@@ -47,6 +42,13 @@ export function loadConfig(): Config {
     .map((c) => c.trim().replace(/^#/, ""))
     .filter(Boolean);
 
+  const syncIntervalMs = parseDuration(process.env.SLACKCRAWL_SYNC_INTERVAL, 10 * 60_000);
+  if (syncIntervalMs === 0) {
+    throw new Error(
+      "Invalid SLACKCRAWL_SYNC_INTERVAL: 0 would sync continuously. Use a real interval (e.g. 5m). To sync once, use `slackcrawl sync`.",
+    );
+  }
+
   const apiKeys = parseApiKeys();
   const allowNoAuth = process.env.SLACKCRAWL_ALLOW_NO_AUTH === "true";
 
@@ -58,23 +60,47 @@ export function loadConfig(): Config {
     apiKeys,
     allowNoAuth,
     channels,
-    syncIntervalMs: parseDuration(process.env.SLACKCRAWL_SYNC_INTERVAL, 10 * 60_000),
+    syncIntervalMs,
     reconcileIntervalMs: parseDuration(process.env.SLACKCRAWL_RECONCILE_INTERVAL, 24 * 3_600_000),
     dbPath: process.env.SLACKCRAWL_DB_PATH ?? `${dataDir}/slackcrawl.db`,
     port: posInt(process.env.PORT, 8080, "PORT"),
     host: process.env.SLACKCRAWL_HOST ?? "0.0.0.0",
     maxLimit: posInt(process.env.SLACKCRAWL_MAX_LIMIT, 500, "SLACKCRAWL_MAX_LIMIT"),
-    threadRepollDays: posInt(process.env.SLACKCRAWL_THREAD_REPOLL_DAYS, 14, "SLACKCRAWL_THREAD_REPOLL_DAYS"),
-    slackMinIntervalMs: posInt(process.env.SLACKCRAWL_SLACK_MIN_INTERVAL_MS, 1200, "SLACKCRAWL_SLACK_MIN_INTERVAL_MS"),
-    slackHistoryLimit: clamp(posInt(process.env.SLACKCRAWL_SLACK_PAGE_LIMIT, 200, "SLACKCRAWL_SLACK_PAGE_LIMIT"), 1, 1000),
+    threadRepollDays: posInt(
+      process.env.SLACKCRAWL_THREAD_REPOLL_DAYS,
+      14,
+      "SLACKCRAWL_THREAD_REPOLL_DAYS",
+    ),
+    slackMinIntervalMs: posInt(
+      process.env.SLACKCRAWL_SLACK_MIN_INTERVAL_MS,
+      1200,
+      "SLACKCRAWL_SLACK_MIN_INTERVAL_MS",
+    ),
+    slackHistoryLimit: clamp(
+      posInt(process.env.SLACKCRAWL_SLACK_PAGE_LIMIT, 200, "SLACKCRAWL_SLACK_PAGE_LIMIT"),
+      1,
+      1000,
+    ),
     claudeApiKey,
     openaiApiKey,
     claudeModel: process.env.CLAUDE_MODEL ?? "claude-sonnet-4-6",
     embeddingModel: process.env.EMBEDDING_MODEL ?? "text-embedding-3-small",
     enrichEnabled: !!(claudeApiKey && openaiApiKey),
-    enrichBatch: clamp(posInt(process.env.SLACKCRAWL_ENRICH_BATCH, 100, "SLACKCRAWL_ENRICH_BATCH"), 1, 2048),
-    enrichMinReplies: posInt(process.env.SLACKCRAWL_ENRICH_MIN_REPLIES, 2, "SLACKCRAWL_ENRICH_MIN_REPLIES"),
-    enrichMaxPerCycle: posInt(process.env.SLACKCRAWL_ENRICH_MAX_PER_CYCLE, 500, "SLACKCRAWL_ENRICH_MAX_PER_CYCLE"),
+    enrichBatch: clamp(
+      posInt(process.env.SLACKCRAWL_ENRICH_BATCH, 100, "SLACKCRAWL_ENRICH_BATCH"),
+      1,
+      2048,
+    ),
+    enrichMinReplies: posInt(
+      process.env.SLACKCRAWL_ENRICH_MIN_REPLIES,
+      2,
+      "SLACKCRAWL_ENRICH_MIN_REPLIES",
+    ),
+    enrichMaxPerCycle: posInt(
+      process.env.SLACKCRAWL_ENRICH_MAX_PER_CYCLE,
+      500,
+      "SLACKCRAWL_ENRICH_MAX_PER_CYCLE",
+    ),
   };
 }
 
@@ -108,7 +134,10 @@ function parseApiKeys(): ApiKey[] {
   if (multi) {
     for (const pair of multi.split(",")) {
       const idx = pair.indexOf(":");
-      if (idx === -1) { add("default", pair); continue; }
+      if (idx === -1) {
+        add("default", pair);
+        continue;
+      }
       add(pair.slice(0, idx), pair.slice(idx + 1));
     }
   }
@@ -122,7 +151,7 @@ function parseApiKeys(): ApiKey[] {
 function posInt(s: string | undefined, def: number, name: string): number {
   if (s === undefined || s === "") return def;
   const n = parseInt(s, 10);
-  if (isNaN(n) || n < 0) {
+  if (Number.isNaN(n) || n < 0) {
     throw new Error(`Invalid ${name}: "${s}" (expected a non-negative integer)`);
   }
   return n;
@@ -142,10 +171,15 @@ function parseDuration(s: string | undefined, def: number): number {
   }
   const n = parseInt(m[1], 10);
   switch (m[2]) {
-    case "ms": return n;
-    case "s":  return n * 1_000;
-    case "m":  return n * 60_000;
-    case "h":  return n * 3_600_000;
-    default:   return def;
+    case "ms":
+      return n;
+    case "s":
+      return n * 1_000;
+    case "m":
+      return n * 60_000;
+    case "h":
+      return n * 3_600_000;
+    default:
+      return def;
   }
 }

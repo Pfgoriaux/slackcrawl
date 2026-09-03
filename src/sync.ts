@@ -1,14 +1,22 @@
 import type { Database } from "bun:sqlite";
-import { SlackClient, tsToUnix, messageId, type SlackMessage } from "./slack";
 import {
-  upsertWorkspace, upsertChannel, upsertUser, upsertMessage,
-  updateLastSyncedTs, getChannelByNameOrId, deactivateUnlistedChannels,
-  getActiveThreadRoots, getAllThreadRoots, getStoredMessageIds, markMessagesDeleted,
+  deactivateUnlistedChannels,
+  getActiveThreadRoots,
+  getAllThreadRoots,
+  getChannelByNameOrId,
+  getStoredMessageIds,
+  markMessagesDeleted,
+  updateLastSyncedTs,
+  upsertChannel,
+  upsertMessage,
+  upsertUser,
+  upsertWorkspace,
 } from "./db";
+import { messageId, type SlackClient, type SlackMessage, tsToUnix } from "./slack";
 
 export interface SyncOptions {
-  full?: boolean;       // full reconciliation: refetch all history + replies, detect edits & deletions
-  channels?: string[];  // filter to these names/IDs (empty = all bot channels)
+  full?: boolean; // full reconciliation: refetch all history + replies, detect edits & deletions
+  channels?: string[]; // filter to these names/IDs (empty = all bot channels)
   threadRepollDays?: number; // re-poll replies for threads active within N days (incremental)
 }
 
@@ -45,7 +53,9 @@ export async function runSync(db: Database, client: SlackClient, opts: SyncOptio
     }
   }
 
-  console.log(`[sync] done${failed ? ` (${failed} channel(s) failed — will retry next cycle)` : ""}`);
+  console.log(
+    `[sync] done${failed ? ` (${failed} channel(s) failed — will retry next cycle)` : ""}`,
+  );
 }
 
 async function syncUsers(db: Database, client: SlackClient, workspaceId: string) {
@@ -79,16 +89,19 @@ async function syncChannels(
 
   const all = [];
   for await (const ch of client.listChannels()) {
-    const passes = filterSet.size === 0
-      || filterSet.has(ch.id.toLowerCase())
-      || filterSet.has(ch.name?.toLowerCase());
+    const passes =
+      filterSet.size === 0 ||
+      filterSet.has(ch.id.toLowerCase()) ||
+      filterSet.has(ch.name?.toLowerCase());
 
     if (!passes) continue; // not in the active filter
 
     // Only channels the bot is actually a member of have readable history.
     if (!ch.is_member) {
       if (filterSet.size > 0) {
-        console.warn(`[sync] #${ch.name ?? ch.id} is in the filter but the bot is not a member — invite it to archive it`);
+        console.warn(
+          `[sync] #${ch.name ?? ch.id} is in the filter but the bot is not a member — invite it to archive it`,
+        );
       }
       continue;
     }
@@ -110,14 +123,22 @@ async function syncChannels(
   }
 
   if (filterSet.size > 0 && all.length === 0) {
-    console.warn("[sync] warning: no channels matched SLACKCRAWL_CHANNELS — check names/IDs and bot membership");
+    console.warn(
+      "[sync] warning: no channels matched SLACKCRAWL_CHANNELS — check names/IDs and bot membership",
+    );
   }
 
   // Channels that left the active filter are deactivated, NOT deleted — their history is kept.
   if (filterSet.size > 0 && all.length > 0) {
-    const deactivated = deactivateUnlistedChannels(db, workspaceId, all.map((c) => c.id));
+    const deactivated = deactivateUnlistedChannels(
+      db,
+      workspaceId,
+      all.map((c) => c.id),
+    );
     if (deactivated.length) {
-      console.log(`[sync] ${deactivated.length} channel(s) no longer in filter — kept archived (history preserved): ${deactivated.join(", ")}`);
+      console.log(
+        `[sync] ${deactivated.length} channel(s) no longer in filter — kept archived (history preserved): ${deactivated.join(", ")}`,
+      );
     }
   }
 
@@ -137,7 +158,9 @@ async function syncChannel(
   // Incremental: only fetch top-level messages newer than what we already have.
   const oldest = full ? undefined : (existing?.last_synced_ts ?? undefined);
 
-  console.log(`[sync] #${channelName} (${channelId})${full ? " [full]" : oldest ? ` since ${oldest}` : " [first sync]"}`);
+  console.log(
+    `[sync] #${channelName} (${channelId})${full ? " [full]" : oldest ? ` since ${oldest}` : " [first sync]"}`,
+  );
 
   let msgCount = 0;
   let newestSeen: string | undefined;
@@ -159,7 +182,9 @@ async function syncChannel(
   //    stored watermark so we only pull genuinely new replies. This is the fix for
   //    replies arriving on threads whose root is outside the incremental window.
   const repoll = new Map<string, string | undefined>(); // thread_ts -> oldest
-  const roots = full ? getAllThreadRoots(db, channelId) : getActiveThreadRoots(db, channelId, repollSince);
+  const roots = full
+    ? getAllThreadRoots(db, channelId)
+    : getActiveThreadRoots(db, channelId, repollSince);
   for (const r of roots) {
     repoll.set(r.thread_ts, full ? undefined : (r.stored_max_reply_ts ?? r.thread_ts));
   }
@@ -170,7 +195,9 @@ async function syncChannel(
   let replyCount = 0;
   for (const [threadTs, replyOldest] of repoll) {
     try {
-      const replies = await client.getReplies(channelId, threadTs, { oldest: replyOldest });
+      const replies = await client.getReplies(channelId, threadTs, {
+        oldest: replyOldest,
+      });
       for (const msg of replies) {
         upsertMsg(db, workspaceId, channelId, msg);
         seenTs?.add(msg.ts);
@@ -192,7 +219,9 @@ async function syncChannel(
     });
     if (missing.length) {
       markMessagesDeleted(db, missing);
-      console.log(`[sync] #${channelName}: ${missing.length} message(s) tombstoned (deleted in Slack)`);
+      console.log(
+        `[sync] #${channelName}: ${missing.length} message(s) tombstoned (deleted in Slack)`,
+      );
     }
   }
 

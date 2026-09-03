@@ -6,17 +6,13 @@
     "useIgnoreFile": true
   },
   "files": {
-    "includes": [
-      "**",
-      "!**/package-lock.json",
-      "!**/bun.lock",
-      "!**/node_modules"
-    ]
+    "includes": ["**", "!**/package-lock.json", "!**/bun.lock", "!**/node_modules"]
   },
   "formatter": {
     "enabled": true,
     "indentStyle": "space",
-    "indentWidth": 2
+    "indentWidth": 2,
+    "lineWidth": 100
   },
   "linter": {
     "enabled": true,
@@ -26,7 +22,8 @@
   },
   "javascript": {
     "formatter": {
-      "quoteStyle": "double"
+      "quoteStyle": "double",
+      "lineWidth": 100
     }
   },
   "assist": {

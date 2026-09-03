@@ -737,7 +737,7 @@ Runs once per day. Users with 5+ messages get an expertise profile generated fro
 | `SLACKCRAWL_API_KEY` | — | Single API key (name `default`). Merged with `SLACKCRAWL_API_KEYS` if both are set. Keys must be ≥16 chars; example placeholders are rejected. |
 | `SLACKCRAWL_ALLOW_NO_AUTH` | `false` | Set `true` to intentionally run unauthenticated. Otherwise `serve` refuses to start with no key. |
 | `SLACKCRAWL_CHANNELS` | all bot channels | Comma-separated channel names or IDs to monitor. Removing a channel here stops syncing it but **never deletes its history**. |
-| `SLACKCRAWL_SYNC_INTERVAL` | `10m` | Incremental polling interval (`5m`, `1h`, etc.) |
+| `SLACKCRAWL_SYNC_INTERVAL` | `10m` | Incremental polling interval (`5m`, `1h`, etc.). `0` is rejected — use `slackcrawl sync` for one-off runs |
 | `SLACKCRAWL_RECONCILE_INTERVAL` | `24h` | Full reconciliation interval. Re-scans everything to catch edits, deletions, and missed replies. `0` disables it. |
 | `SLACKCRAWL_THREAD_REPOLL_DAYS` | `14` | Each incremental cycle re-polls replies for threads active within this many days (cheap fix for replies on older threads). |
 | `SLACKCRAWL_SLACK_MIN_INTERVAL_MS` | `1200` | Minimum ms between **all** Slack API calls (global rate limiter). Raise for apps under Slack's new ~1 req/min cap (see below). |

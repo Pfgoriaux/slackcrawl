@@ -76,7 +76,10 @@ export class SlackClient {
   private readonly historyLimit: number;
   private nextSlot = 0; // global rate-limiter cursor (epoch ms)
 
-  constructor(private readonly token: string, opts: SlackClientOptions = {}) {
+  constructor(
+    private readonly token: string,
+    opts: SlackClientOptions = {},
+  ) {
     this.minIntervalMs = opts.minIntervalMs ?? 1200;
     this.historyLimit = opts.historyLimit ?? 200;
   }
@@ -96,7 +99,12 @@ export class SlackClient {
       const data = await this.get<{
         channels: SlackChannel[];
         response_metadata: { next_cursor: string };
-      }>("conversations.list", { types, exclude_archived: "false", limit: "200", cursor });
+      }>("conversations.list", {
+        types,
+        exclude_archived: "false",
+        limit: "200",
+        cursor,
+      });
       for (const ch of data.channels) yield ch;
       cursor = data.response_metadata?.next_cursor ?? "";
     } while (cursor);
@@ -137,7 +145,11 @@ export class SlackClient {
   }
 
   /** Fetch thread replies. `oldest` (exclusive) lets us pull only new replies. */
-  async getReplies(channelId: string, threadTs: string, opts: { oldest?: string } = {}): Promise<SlackMessage[]> {
+  async getReplies(
+    channelId: string,
+    threadTs: string,
+    opts: { oldest?: string } = {},
+  ): Promise<SlackMessage[]> {
     const all: SlackMessage[] = [];
     let cursor = "";
     do {
@@ -174,11 +186,11 @@ export class SlackClient {
 
       if (res.status === 429) {
         const retryAfter = parseInt(res.headers.get("Retry-After") ?? "60", 10);
-        throw new RateLimitError((isNaN(retryAfter) ? 60 : retryAfter) * 1000);
+        throw new RateLimitError((Number.isNaN(retryAfter) ? 60 : retryAfter) * 1000);
       }
       if (!res.ok) throw new Error(`Slack HTTP ${res.status} for ${method}`);
 
-      const json = await res.json() as { ok: boolean; error?: string } & T;
+      const json = (await res.json()) as { ok: boolean; error?: string } & T;
       if (!json.ok) throw new Error(`Slack API error: ${json.error}`);
       return json;
     });
@@ -202,7 +214,9 @@ export class SlackClient {
           const wait = err.retryAfterMs + Math.random() * 5000;
           // Push the global slot cursor out so other in-flight requests also back off.
           this.nextSlot = Math.max(this.nextSlot, Date.now() + wait);
-          console.log(`[slack] rate limited, waiting ${Math.round(wait / 1000)}s (attempt ${attempt + 1}/${maxAttempts})`);
+          console.log(
+            `[slack] rate limited, waiting ${Math.round(wait / 1000)}s (attempt ${attempt + 1}/${maxAttempts})`,
+          );
           await sleep(wait);
           continue;
         }
