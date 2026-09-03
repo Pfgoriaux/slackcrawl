@@ -1,3 +1,8 @@
+---
+name: ask-slack
+description: Answer a question using the slackcrawl archive (Slack mirror REST API + local SQLite). Use when asked to look something up in Slack history, threads, decisions, or digests.
+---
+
 Answer this question using the slackcrawl archive: $ARGUMENTS
 
 ## What you have access to

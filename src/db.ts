@@ -13,6 +13,7 @@ export {
   getStats,
   getStoredMessageIds,
   getThread,
+  getThreadMessageIds,
   getUsers,
   getWorkspace,
   queryMessages,

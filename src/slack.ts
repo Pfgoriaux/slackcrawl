@@ -69,11 +69,13 @@ export interface AuthTestResult {
 export interface SlackClientOptions {
   minIntervalMs?: number;
   historyLimit?: number;
+  timeoutMs?: number; // per-request timeout (default 30s)
 }
 
 export class SlackClient {
   private readonly minIntervalMs: number;
   private readonly historyLimit: number;
+  private readonly timeoutMs: number;
   private nextSlot = 0; // global rate-limiter cursor (epoch ms)
 
   constructor(
@@ -82,6 +84,7 @@ export class SlackClient {
   ) {
     this.minIntervalMs = opts.minIntervalMs ?? 1200;
     this.historyLimit = opts.historyLimit ?? 200;
+    this.timeoutMs = opts.timeoutMs ?? 30_000;
   }
 
   async authTest(): Promise<AuthTestResult> {
@@ -180,13 +183,25 @@ export class SlackClient {
 
     return this.withRetry(async () => {
       await this.acquireSlot();
-      const res = await fetch(url.toString(), {
-        headers: { Authorization: `Bearer ${this.token}` },
-      });
+      let res: Response;
+      try {
+        res = await fetch(url.toString(), {
+          headers: { Authorization: `Bearer ${this.token}` },
+          // Without an explicit timeout a hung connection wedges the sync loop,
+          // making every later cycle a no-op while /health stays green.
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+      } catch (err) {
+        // Network failures and timeouts are transient — retry them.
+        throw new TransientError(`Slack fetch failed for ${method}: ${err}`);
+      }
 
       if (res.status === 429) {
         const retryAfter = parseInt(res.headers.get("Retry-After") ?? "60", 10);
         throw new RateLimitError((Number.isNaN(retryAfter) ? 60 : retryAfter) * 1000);
+      }
+      if (res.status >= 500) {
+        throw new TransientError(`Slack HTTP ${res.status} for ${method}`);
       }
       if (!res.ok) throw new Error(`Slack HTTP ${res.status} for ${method}`);
 
@@ -220,6 +235,15 @@ export class SlackClient {
           await sleep(wait);
           continue;
         }
+        if (err instanceof TransientError) {
+          // 5xx / network / timeout: exponential backoff, capped at 30s.
+          const wait = Math.min(1000 * 2 ** attempt, 30_000) + Math.random() * 1000;
+          console.log(
+            `[slack] transient error (${err.message}), retrying in ${Math.round(wait / 1000)}s (attempt ${attempt + 1}/${maxAttempts})`,
+          );
+          await sleep(wait);
+          continue;
+        }
         throw err;
       }
     }
@@ -232,6 +256,9 @@ class RateLimitError extends Error {
     super(`Rate limited, retry after ${retryAfterMs}ms`);
   }
 }
+
+/** Retriable failure: HTTP 5xx, network error, or request timeout. */
+class TransientError extends Error {}
 
 // ---- Helpers ----
 
