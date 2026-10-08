@@ -1,4 +1,5 @@
 name: CI
+# CI runs on the self-hosted runner (ci-runner, arm64): GitHub-hosted minutes are not used.
 
 on:
   push:
@@ -7,7 +8,7 @@ on:
 
 jobs:
   ci:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, docker]
     steps:
       - uses: actions/checkout@v4
 
