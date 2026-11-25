@@ -1,5 +1,5 @@
 name: CI
-# CI runs on the self-hosted runner (ci-runner, arm64): GitHub-hosted minutes are not used.
+# CI runs on Boat CI runners (runs-on: boat*): GitHub-hosted minutes are not used.
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 
 jobs:
   ci:
-    runs-on: [self-hosted, docker]
+    runs-on: boat-small
     steps:
       - uses: actions/checkout@v4
 
